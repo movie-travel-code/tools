@@ -1,0 +1,44 @@
+dist: xenial
+
+language: go
+
+branches:
+  only:
+    - master
+
+install:
+  - git clone https://github.com/elastic/go-langserver $GOPATH/src/golang.org/x/tools
+  - cd $GOPATH/src/golang.org/x/tools
+
+git:
+  depth: 1
+
+env:
+  - GO111MODULE=on GOPROXY=https://proxy.golang.org
+
+
+before_install:
+  - go get -u golang.org/x/lint/golint
+  - go get golang.org/x/sync/errgroup
+
+script:
+  - set -e;
+  - make lint
+  - go test ./internal/lsp
+  - go install ./cmd/gopls -o go-langserver
+
+matrix:
+  include:
+    - name: Unit Tests & Package | Linux, go:stable, gomod=on
+      os: linux
+      after_script:
+        - cd $GOPATH/bin
+        - curl -O https://dl.google.com/go/go1.12.7.linux-amd64.tar.gz
+        - tar xvzf go1.12.7.linux-amd64.tar.gz
+
+    - name: Unit Tests & Package | OSX, go:stable, gomod=on
+      os: osx
+      after_script:
+        - cd $GOPATH/bin
+        - curl -O https://dl.google.com/go/go1.12.7.darwin-amd64.tar.gz
+        - tar xvzf go1.12.7.darwin-amd64.tar.gz
