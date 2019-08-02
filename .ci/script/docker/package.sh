@@ -73,9 +73,10 @@ docker run \
                       jq '.version=\"\\(.version)-windows\"' package.json > package-windows.json
                       mkdir packages
                       for PLATFORM in linux darwin windows
+                      do
                         curl -O https://github.com/elastic/go-langserver/releases/download/v$KIBANA_VERSION/go-langserver-$PLATFORM-amd64.tar.gz
                         mkdir lib
-                        tar -xzf go-langserver-$PLATFORM-amd64.tar.gz ./lib
+                        tar -xzf go-langserver-$PLATFORM-amd64.tar.gz -C ./lib
                         mv package-\$PLATFORM.json package.json
                         echo $KIBANA_VERSION | /plugin/kibana/packages/kbn-plugin-helpers/bin/plugin-helpers.js build
                         mv build/go-langserver*.zip packages
