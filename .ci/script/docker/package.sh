@@ -67,6 +67,8 @@ docker run \
                         fi
                       done
 
+                      $CMD
+
                       /plugin/kibana/node_modules/git-hash-package/index.js
                       jq '.version=\"\\(.version)-linux\"' package.json > package-linux.json
                       jq '.version=\"\\(.version)-darwin\"' package.json > package-darwin.json
@@ -80,7 +82,7 @@ docker run \
                         mv package-\$PLATFORM.json package.json
                         echo $KIBANA_VERSION | /plugin/kibana/packages/kbn-plugin-helpers/bin/plugin-helpers.js build
                         mv build/go-langserver*.zip packages
-                      [ -e ./lib ] && rm -rf ./lib
+                        [ -e ./lib ] && rm -rf ./lib
                       do
                       done"
 
