@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -e
 
+
+TAG_NAME=$(git rev-parse --short HEAD)
+
 if [[ $# -eq 0 ]]; then
     echo "deploy snapshot package.."
     KIBANA_VERSION=8.0.0
@@ -13,6 +16,7 @@ elif [[ $# -eq 2 ]]; then
     VERSION=$1
     KIBANA_VERSION=$2
     DESTINATION=release/
+    TAG_NAME=$1-$TAG_NAME
     CMD="jq '.version=\"$VERSION\"' package.json > tmp && mv tmp package.json"
 else
     echo "Wrong number of parameters!"
@@ -76,7 +80,7 @@ docker run \
                       mkdir packages
                       for PLATFORM in linux darwin windows
                       do
-                        curl -OL https://github.com/elastic/go-langserver/releases/download/v$KIBANA_VERSION/go-langserver-\$PLATFORM-amd64.tar.gz
+                        curl -OL https://github.com/elastic/go-langserver/releases/download/$TAG_NAME/go-langserver-\$PLATFORM-amd64.tar.gz
                         mkdir lib
                         tar -xzf go-langserver-\$PLATFORM-amd64.tar.gz -C ./lib
                         mv package-\$PLATFORM.json package.json
