@@ -5,7 +5,7 @@ image: Visual Studio 2017
 stack: go 1.12.x
 platform:
   - x64
-  - x86
+  #- x86(Appveyor has artifacts packages' size limit, remove the unused x86 artifacts generation)
 
 notifications:
   - provider: GitHubPullRequest
@@ -30,7 +30,7 @@ build_script:
   # - go test ./internal/lsp -v
   - mkdir go-langserver-windows
   - cd go-langserver-windows
-  - go build -o go-langserver.exe c:\gopath\src\golang.org\x\tools\cmd\gopls
+  - go build -ldflags "-s -w" -o go-langserver.exe c:\gopath\src\golang.org\x\tools\cmd\gopls
   - if %platform%==x64 curl -o go1.12.7.windows-%platform%.zip https://dl.google.com/go/go1.12.7.windows-amd64.zip
   - if %platform%==x86 curl -o go1.12.7.windows-%platform%.zip https://dl.google.com/go/go1.12.7.windows-386.zip
   - 7z x go1.12.7.windows-%platform%.zip -o.
