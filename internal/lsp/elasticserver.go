@@ -138,6 +138,10 @@ func (s *ElasticServer) EDefinition(ctx context.Context, params *protocol.TextDo
 	return []protocol.SymbolLocator{{Qname: qname, Kind: kind, Path: path, Loc: loc, Package: pkgLocator}}, nil
 }
 
+const (
+	folderSkip = string(filepath.Separator) + "vendor" + string(filepath.Separator)
+)
+
 // Full collects the symbols defined in the current file and the references.
 func (s *ElasticServer) Full(ctx context.Context, fullParams *protocol.FullParams) (protocol.FullResponse, error) {
 	params := protocol.DocumentSymbolParams{TextDocument: fullParams.TextDocument}
@@ -146,6 +150,11 @@ func (s *ElasticServer) Full(ctx context.Context, fullParams *protocol.FullParam
 		References: []protocol.Reference{},
 	}
 	uri := span.NewURI(fullParams.TextDocument.URI)
+	// Intercept the 'full' request for 'vendor' folder.
+	// TODO(henrywong) Support the code intelligence for 'vendor' folder
+	if ok := strings.Contains(uri.Filename(), folderSkip); ok {
+		return fullResponse, nil
+	}
 	view := s.session.ViewOf(uri)
 	f, _, err := getGoFile(ctx, view, uri)
 	if err != nil {
@@ -474,8 +483,8 @@ func collectWorkspaceFolderMetadata(metadata *WorkspaceFolderMeta) error {
 	rootPath := metadata.URI.Filename()
 	// Collect 'go.mod' and record them as workspace folders.
 	if err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
-		dir := filepath.Dir(path)
-		if dir[0] == '.' {
+		base := filepath.Base(path)
+		if base[0] == '.' || base == "vendor" {
 			return filepath.SkipDir
 		} else if info.Name() == "go.mod" {
 			dir := filepath.Dir(path)
