@@ -227,13 +227,13 @@ func (h elasticServerHandler) Deliver(ctx context.Context, r *jsonrpc2.Request, 
 			log.Error(ctx, "", err)
 		}
 		resp, err := h.server.Initialize(ctx, &params)
-		if err := r.Reply(ctx, resp, err); err != nil {
+		if err := NoDiagnosticsReply(r, ctx, resp, err); err != nil {
 			log.Error(ctx, "", err)
 		}
 		return true
 	case "shutdown": // req
 		if r.Params != nil {
-			r.Reply(ctx, nil, jsonrpc2.NewErrorf(jsonrpc2.CodeInvalidParams, "Expected no params"))
+			NoDiagnosticsReply(r, ctx, nil, jsonrpc2.NewErrorf(jsonrpc2.CodeInvalidParams, "Expected no params"))
 			return true
 		}
 		if err := h.server.Shutdown(ctx); err != nil {
@@ -313,7 +313,7 @@ func (h elasticServerHandler) Deliver(ctx context.Context, r *jsonrpc2.Request, 
 			return true
 		}
 		resp, err := h.server.EDefinition(ctx, &params)
-		if err := r.Reply(ctx, resp, err); err != nil {
+		if err := NoDiagnosticsReply(r, ctx, resp, err); err != nil {
 			log.Error(ctx, "", err)
 		}
 		return true
@@ -324,7 +324,7 @@ func (h elasticServerHandler) Deliver(ctx context.Context, r *jsonrpc2.Request, 
 			return true
 		}
 		resp, err := h.server.References(ctx, &params)
-		if err := r.Reply(ctx, resp, err); err != nil {
+		if err := NoDiagnosticsReply(r, ctx, resp, err); err != nil {
 			log.Error(ctx, "", err)
 		}
 		return true
@@ -346,7 +346,7 @@ func (h elasticServerHandler) Deliver(ctx context.Context, r *jsonrpc2.Request, 
 			return true
 		}
 		resp, err := h.server.DocumentSymbol(ctx, &params)
-		if err := r.Reply(ctx, resp, err); err != nil {
+		if err := NoDiagnosticsReply(r, ctx, resp, err); err != nil {
 			log.Error(ctx, "", err)
 		}
 		return true
@@ -413,7 +413,7 @@ func (h elasticServerHandler) Deliver(ctx context.Context, r *jsonrpc2.Request, 
 		}
 
 		resp, err := h.server.Full(ctx, &fullParams)
-		if err := r.Reply(ctx, resp, err); err != nil {
+		if err := NoDiagnosticsReply(r, ctx, resp, err); err != nil {
 			log.Error(ctx, "", err)
 		}
 		return true
@@ -506,4 +506,8 @@ func NewElasticServer(ctx context.Context, stream jsonrpc2.Stream, server Elasti
 	ctx = WithClient(ctx, client)
 	conn.AddHandler(&elasticServerHandler{server: server})
 	return ctx, conn, client
+}
+
+func NoDiagnosticsReply(r *jsonrpc2.Request, ctx context.Context, result interface{}, err error) error {
+	return r.Reply(ctx, result, nil)
 }
