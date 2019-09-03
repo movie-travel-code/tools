@@ -18,9 +18,6 @@ install:
 git:
   depth: 1
 
-env:
-  - GO111MODULE=off GOPROXY=https://proxy.golang.org
-
 before_install:
   - go get golang.org/x/sync/errgroup
   - go get golang.org/x/xerrors
@@ -31,6 +28,11 @@ matrix:
   include:
     - name: Unit Tests & Package | Linux x64
       os: linux
+      env:
+        - GO111MODULE=off
+        - GOPROXY=https://proxy.golang.org
+        - CGO_ENABLED=0
+        - ARCH=x86_64
       script:
         - go test ./internal/lsp
         - mkdir build
@@ -83,6 +85,11 @@ matrix:
 
     - name: Unit Tests & Package | OSX
       os: osx
+      env:
+        - GO111MODULE=off
+        - GOPROXY=https://proxy.golang.org
+        - CGO_ENABLED=0
+        - ARCH=x86_64
       script:
         - go test ./internal/lsp
         - mkdir build

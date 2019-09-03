@@ -17,6 +17,7 @@ environment:
   GOPATH: c:\gopath
   GO111MODULE: off
   GOPROXY: "https://proxy.golang.org"
+  CGO_ENABLED: 0
   github_access_token:
     secure: h4ICNdm1D4g1klCMU6lQ7t92lwIrzo2HHzqc9MJpZdibgfNNFNGwywHWyBa0KPpL
   github_email:
