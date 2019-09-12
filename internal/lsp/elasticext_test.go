@@ -70,7 +70,7 @@ func testLSPExt(t *testing.T, exporter packagestest.Exporter) {
 	var (
 		pkgMod = filepath.Join(os.Getenv("GOPATH"), "pkg", "mod")
 	)
-	es := &ElasticServer{*s}
+	es := &ElasticServer{*s, nil}
 
 	expectedQNameKinds := make(QnameKindMap)
 	expectedPkgLocators := make(PkgMap)
