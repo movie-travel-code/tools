@@ -30,20 +30,19 @@ func (c *completer) item(cand candidate) (CompletionItem, error) {
 	}
 
 	var (
-		label              = cand.name
-		detail             = types.TypeString(obj.Type(), c.qf)
-		insert             = label
-		kind               CompletionItemKind
-		plainSnippet       *snippet.Builder
-		placeholderSnippet *snippet.Builder
-		protocolEdits      []protocol.TextEdit
+		label         = cand.name
+		detail        = types.TypeString(obj.Type(), c.qf)
+		insert        = label
+		kind          CompletionItemKind
+		snip          *snippet.Builder
+		protocolEdits []protocol.TextEdit
 	)
 
-	// expandFuncCall mutates the completion label, detail, and snippets
+	// expandFuncCall mutates the completion label, detail, and snippet
 	// to that of an invocation of sig.
 	expandFuncCall := func(sig *types.Signature) {
 		params := formatParams(sig.Params(), sig.Variadic(), c.qf)
-		plainSnippet, placeholderSnippet = c.functionCallSnippets(label, params)
+		snip = c.functionCallSnippet(label, params)
 		results, writeParens := formatResults(sig.Results(), c.qf)
 		detail = "func" + formatFunction(params, results, writeParens)
 	}
@@ -59,7 +58,7 @@ func (c *completer) item(cand candidate) (CompletionItem, error) {
 		}
 		if obj.IsField() {
 			kind = FieldCompletionItem
-			plainSnippet, placeholderSnippet = c.structFieldSnippets(label, detail)
+			snip = c.structFieldSnippet(label, detail)
 		} else if c.isParameter(obj) {
 			kind = ParameterCompletionItem
 		} else {
@@ -110,55 +109,37 @@ func (c *completer) item(cand candidate) (CompletionItem, error) {
 		Kind:                kind,
 		Score:               cand.score,
 		Depth:               len(c.deepState.chain),
-		plainSnippet:        plainSnippet,
-		placeholderSnippet:  placeholderSnippet,
+		snippet:             snip,
 	}
-	// TODO(rstambler): Log errors when this feature is enabled.
-	if c.opts.WantDocumentaton {
-		declRange, err := objToRange(c.ctx, c.view.Session().Cache().FileSet(), obj)
-		if err != nil {
-			goto Return
-		}
-		pos := declRange.FileSet.Position(declRange.Start)
-		if !pos.IsValid() {
-			goto Return
-		}
-		uri := span.FileURI(pos.Filename)
-		f, err := c.view.GetFile(c.ctx, uri)
-		if err != nil {
-			goto Return
-		}
-		gof, ok := f.(GoFile)
-		if !ok {
-			goto Return
-		}
-		pkg, err := gof.GetCachedPackage(c.ctx)
-		if err != nil {
-			goto Return
-		}
-		var file *ast.File
-		for _, ph := range pkg.GetHandles() {
-			if ph.File().Identity().URI == gof.URI() {
-				file, _ = ph.Cached(c.ctx)
-			}
-		}
-		if file == nil {
-			goto Return
-		}
-		ident, err := findIdentifier(c.ctx, gof, pkg, file, declRange.Start)
-		if err != nil {
-			goto Return
-		}
-		hover, err := ident.Hover(c.ctx)
-		if err != nil {
-			goto Return
-		}
-		item.Documentation = hover.Synopsis
-		if c.opts.WantFullDocumentation {
-			item.Documentation = hover.FullDocumentation
-		}
+	// If the user doesn't want documentation for completion items.
+	if !c.opts.Documentation {
+		return item, nil
 	}
-Return:
+	pos := c.view.Session().Cache().FileSet().Position(obj.Pos())
+
+	// We ignore errors here, because some types, like "unsafe" or "error",
+	// may not have valid positions that we can use to get documentation.
+	if !pos.IsValid() {
+		return item, nil
+	}
+
+	uri := span.FileURI(pos.Filename)
+	_, file, pkg, err := c.pkg.FindFile(c.ctx, uri, obj.Pos())
+	if err != nil {
+		return CompletionItem{}, err
+	}
+	ident, err := findIdentifier(c.ctx, c.view, []Package{pkg}, file, obj.Pos())
+	if err != nil {
+		return CompletionItem{}, err
+	}
+	hover, err := ident.Hover(c.ctx)
+	if err != nil {
+		return CompletionItem{}, err
+	}
+	item.Documentation = hover.Synopsis
+	if c.opts.FullDocumentation {
+		item.Documentation = hover.FullDocumentation
+	}
 	return item, nil
 }
 
@@ -196,7 +177,7 @@ func (c *completer) formatBuiltin(cand candidate) CompletionItem {
 		results, writeResultParens := formatFieldList(c.ctx, c.view, decl.Type.Results)
 		item.Label = obj.Name()
 		item.Detail = "func" + formatFunction(params, results, writeResultParens)
-		item.plainSnippet, item.placeholderSnippet = c.functionCallSnippets(obj.Name(), params)
+		item.snippet = c.functionCallSnippet(obj.Name(), params)
 	case *types.TypeName:
 		if types.IsInterface(obj.Type()) {
 			item.Kind = InterfaceCompletionItem

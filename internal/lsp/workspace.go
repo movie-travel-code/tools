@@ -7,11 +7,12 @@ package lsp
 import (
 	"context"
 
+	"os/exec"
+
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/telemetry/log"
 	errors "golang.org/x/xerrors"
-	"os/exec"
 )
 
 func (s *Server) changeFolders(ctx context.Context, event protocol.WorkspaceFoldersChangeEvent) error {
@@ -47,8 +48,12 @@ func (s *Server) addView(ctx context.Context, name string, uri span.URI) error {
 	s.stateMu.Lock()
 	state := s.state
 	s.stateMu.Unlock()
-	if state >= serverInitialized {
-		s.fetchConfig(ctx, view)
+	if state < serverInitialized {
+		return errors.Errorf("addView called before server initialized")
 	}
+
+	options := s.session.Options()
+	s.fetchConfig(ctx, name, uri, &options)
+	s.session.NewView(ctx, name, uri, options)
 	return nil
 }

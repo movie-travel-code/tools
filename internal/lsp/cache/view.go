@@ -12,6 +12,7 @@ import (
 	"go/token"
 	"go/types"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -28,6 +29,8 @@ import (
 type view struct {
 	session *session
 	id      string
+
+	options source.Options
 
 	// mu protects all mutable state of the view.
 	mu sync.Mutex
@@ -50,9 +53,6 @@ type view struct {
 	// Folder is the root of this view.
 	folder span.URI
 
-	// env is the environment to use when invoking underlying tools.
-	env []string
-
 	// process is the process env for this view.
 	// Note: this contains cached module and filesystem state.
 	//
@@ -65,9 +65,6 @@ type view struct {
 	// by processEnvs resolver.
 	// TODO(suzmue): These versions may not actually be on disk.
 	modFileVersions map[string]string
-
-	// buildFlags is the build flags to use when invoking underlying tools.
-	buildFlags []string
 
 	// keep track of files by uri and by basename, a single file may be mapped
 	// to multiple uris, and the same basename may map to multiple files
@@ -88,7 +85,6 @@ type view struct {
 type metadataCache struct {
 	mu       sync.Mutex // guards both maps
 	packages map[packageID]*metadata
-	ids      map[packagePath]packageID
 }
 
 type metadata struct {
@@ -117,14 +113,22 @@ func (v *view) Folder() span.URI {
 	return v.folder
 }
 
+func (v *view) Options() source.Options {
+	return v.options
+}
+
+func (v *view) SetOptions(options source.Options) {
+	v.options = options
+}
+
 // Config returns the configuration used for the view's interaction with the
 // go/packages API. It is shared across all views.
 func (v *view) Config(ctx context.Context) *packages.Config {
 	// TODO: Should we cache the config and/or overlay somewhere?
 	return &packages.Config{
 		Dir:        v.folder.Filename(),
-		Env:        v.env,
-		BuildFlags: v.buildFlags,
+		Env:        v.options.Env,
+		BuildFlags: v.options.BuildFlags,
 		Mode: packages.NeedName |
 			packages.NeedFiles |
 			packages.NeedCompiledGoFiles |
@@ -147,7 +151,10 @@ func (v *view) RunProcessEnvFunc(ctx context.Context, fn func(*imports.Options) 
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.processEnv == nil {
-		v.processEnv = v.buildProcessEnv(ctx)
+		var err error
+		if v.processEnv, err = v.buildProcessEnv(ctx); err != nil {
+			return err
+		}
 	}
 
 	// Before running the user provided function, clear caches in the resolver.
@@ -176,7 +183,7 @@ func (v *view) RunProcessEnvFunc(ctx context.Context, fn func(*imports.Options) 
 	return nil
 }
 
-func (v *view) buildProcessEnv(ctx context.Context) *imports.ProcessEnv {
+func (v *view) buildProcessEnv(ctx context.Context) (*imports.ProcessEnv, error) {
 	cfg := v.Config(ctx)
 	env := &imports.ProcessEnv{
 		WorkingDir: cfg.Dir,
@@ -197,14 +204,24 @@ func (v *view) buildProcessEnv(ctx context.Context) *imports.ProcessEnv {
 		case "GO111MODULE":
 			env.GO111MODULE = split[1]
 		case "GOPROXY":
-			env.GOROOT = split[1]
+			env.GOPROXY = split[1]
 		case "GOFLAGS":
 			env.GOFLAGS = split[1]
 		case "GOSUMDB":
 			env.GOSUMDB = split[1]
 		}
 	}
-	return env
+
+	if env.GOPATH == "" {
+		cmd := exec.CommandContext(ctx, "go", "env", "GOPATH")
+		cmd.Env = cfg.Env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return nil, err
+		} else {
+			env.GOPATH = strings.TrimSpace(string(out))
+		}
+	}
+	return env, nil
 }
 
 func (v *view) modFilesChanged() bool {
@@ -240,26 +257,6 @@ func (v *view) fileVersion(filename string) string {
 	uri := span.FileURI(filename)
 	f := v.session.GetFile(uri)
 	return f.Identity().Version
-}
-
-func (v *view) Env() []string {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.env
-}
-
-func (v *view) SetEnv(env []string) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	//TODO: this should invalidate the entire view
-	v.env = env
-	v.processEnv = nil // recompute process env
-}
-
-func (v *view) SetBuildFlags(buildFlags []string) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.buildFlags = buildFlags
 }
 
 func (v *view) Shutdown(ctx context.Context) {
@@ -351,25 +348,48 @@ func (f *goFile) invalidateContent(ctx context.Context) {
 	f.view.mcache.mu.Lock()
 	defer f.view.mcache.mu.Unlock()
 
+	var toDelete []packageID
+	f.mu.Lock()
+	for id, cph := range f.pkgs {
+		if cph != nil {
+			toDelete = append(toDelete, id)
+		}
+	}
+	f.mu.Unlock()
+
 	f.handleMu.Lock()
 	defer f.handleMu.Unlock()
 
-	f.invalidateAST(ctx)
+	// Remove the package and all of its reverse dependencies from the cache.
+	for _, id := range toDelete {
+		f.view.remove(ctx, id, map[packageID]struct{}{})
+	}
+
 	f.handle = nil
 }
 
-// invalidateAST invalidates the AST of a Go file,
-// including any position and type information that depends on it.
-func (f *goFile) invalidateAST(ctx context.Context) {
-	f.mu.Lock()
-	cphs := f.pkgs
-	f.mu.Unlock()
+// invalidateMeta invalidates package metadata for all files in f's
+// package. This forces f's package's metadata to be reloaded next
+// time the package is checked.
+func (f *goFile) invalidateMeta(ctx context.Context) {
+	pkgs, err := f.GetPackages(ctx)
+	if err != nil {
+		log.Error(ctx, "invalidateMeta: GetPackages", err, telemetry.File.Of(f.URI()))
+		return
+	}
 
-	// Remove the package and all of its reverse dependencies from the cache.
-	for id, cph := range cphs {
-		if cph != nil {
-			f.view.remove(ctx, id, map[packageID]struct{}{})
+	for _, pkg := range pkgs {
+		for _, pgh := range pkg.GetHandles() {
+			uri := pgh.File().Identity().URI
+			if gof, _ := f.view.FindFile(ctx, uri).(*goFile); gof != nil {
+				gof.mu.Lock()
+				gof.meta = nil
+				gof.mu.Unlock()
+			}
 		}
+		f.view.mcache.mu.Lock()
+		delete(f.view.mcache.packages, packageID(pkg.ID()))
+		f.view.mcache.mu.Unlock()
 	}
 }
 
@@ -406,6 +426,7 @@ func (v *view) remove(ctx context.Context, id packageID, seen map[packageID]stru
 		if cph, ok := gof.pkgs[id]; ok {
 			// Delete the package handle from the store.
 			v.session.cache.store.Delete(checkPackageKey{
+				id:     cph.ID(),
 				files:  hashParseKeys(cph.Files()),
 				config: hashConfig(cph.Config()),
 			})

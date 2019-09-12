@@ -7,6 +7,7 @@ package cache
 import (
 	"context"
 	"go/ast"
+	"go/token"
 	"go/types"
 	"sort"
 	"sync"
@@ -14,6 +15,8 @@ import (
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/lsp/source"
+	"golang.org/x/tools/internal/span"
+	errors "golang.org/x/xerrors"
 )
 
 // pkg contains the type information needed by the source package.
@@ -39,7 +42,7 @@ type pkg struct {
 	analyses map[*analysis.Analyzer]*analysisEntry
 
 	diagMu      sync.Mutex
-	diagnostics []source.Diagnostic
+	diagnostics map[*analysis.Analyzer][]source.Diagnostic
 }
 
 // packageID is a type that abstracts a package ID.
@@ -180,14 +183,51 @@ func (pkg *pkg) IsIllTyped() bool {
 	return pkg.types == nil || pkg.typesInfo == nil || pkg.typesSizes == nil
 }
 
-func (pkg *pkg) SetDiagnostics(diags []source.Diagnostic) {
+func (pkg *pkg) SetDiagnostics(a *analysis.Analyzer, diags []source.Diagnostic) {
 	pkg.diagMu.Lock()
 	defer pkg.diagMu.Unlock()
-	pkg.diagnostics = diags
+	if pkg.diagnostics == nil {
+		pkg.diagnostics = make(map[*analysis.Analyzer][]source.Diagnostic)
+	}
+	pkg.diagnostics[a] = diags
 }
 
 func (pkg *pkg) GetDiagnostics() []source.Diagnostic {
 	pkg.diagMu.Lock()
 	defer pkg.diagMu.Unlock()
-	return pkg.diagnostics
+
+	var diags []source.Diagnostic
+	for _, d := range pkg.diagnostics {
+		diags = append(diags, d...)
+	}
+	return diags
+}
+
+func (p *pkg) FindFile(ctx context.Context, uri span.URI, pos token.Pos) (source.ParseGoHandle, *ast.File, source.Package, error) {
+	queue := []*pkg{p}
+	seen := make(map[string]bool)
+
+	for len(queue) > 0 {
+		pkg := queue[0]
+		queue = queue[1:]
+		seen[pkg.ID()] = true
+
+		for _, ph := range pkg.files {
+			if ph.File().Identity().URI == uri {
+				file, err := ph.Cached(ctx)
+				if file == nil {
+					return nil, nil, nil, err
+				}
+				if file.Pos() <= pos && pos <= file.End() {
+					return ph, file, pkg, nil
+				}
+			}
+		}
+		for _, dep := range pkg.imports {
+			if !seen[dep.ID()] {
+				queue = append(queue, dep)
+			}
+		}
+	}
+	return nil, nil, nil, errors.Errorf("no file for %s", uri)
 }

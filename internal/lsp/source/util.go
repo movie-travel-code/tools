@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/span"
+	errors "golang.org/x/xerrors"
 )
 
 type mappedRange struct {
@@ -42,8 +43,114 @@ func (s mappedRange) Range() (protocol.Range, error) {
 	return *s.protocolRange, nil
 }
 
+func (s mappedRange) Span() (span.Span, error) {
+	return s.spanRange.Span()
+}
+
 func (s mappedRange) URI() span.URI {
 	return s.m.URI
+}
+
+// bestCheckPackageHandle picks the "narrowest" package for a given file.
+//
+// By "narrowest" package, we mean the package with the fewest number of files
+// that includes the given file. This solves the problem of test variants,
+// as the test will have more files than the non-test package.
+func bestPackage(uri span.URI, pkgs []Package) (Package, error) {
+	var result Package
+	for _, pkg := range pkgs {
+		if result == nil || len(pkg.GetHandles()) < len(result.GetHandles()) {
+			result = pkg
+		}
+	}
+	if result == nil {
+		return nil, errors.Errorf("no CheckPackageHandle for %s", uri)
+	}
+	return result, nil
+}
+
+func fileToMapper(ctx context.Context, view View, uri span.URI) (*ast.File, []Package, *protocol.ColumnMapper, error) {
+	f, err := view.GetFile(ctx, uri)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	gof, ok := f.(GoFile)
+	if !ok {
+		return nil, nil, nil, errors.Errorf("%s is not a Go file", f.URI())
+	}
+	pkgs, err := gof.GetPackages(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	pkg, err := bestPackage(f.URI(), pkgs)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	file, m, err := pkgToMapper(ctx, view, pkg, uri)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return file, pkgs, m, nil
+}
+
+func cachedFileToMapper(ctx context.Context, view View, uri span.URI) (*ast.File, *protocol.ColumnMapper, error) {
+	f, err := view.GetFile(ctx, uri)
+	if err != nil {
+		return nil, nil, err
+	}
+	gof, ok := f.(GoFile)
+	if !ok {
+		return nil, nil, errors.Errorf("%s is not a Go file", f.URI())
+	}
+	if file, ok := gof.Builtin(); ok {
+		return builtinFileToMapper(ctx, view, gof, file)
+	}
+	pkg, err := gof.GetCachedPackage(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	file, m, err := pkgToMapper(ctx, view, pkg, uri)
+	if err != nil {
+		return nil, nil, err
+	}
+	return file, m, nil
+}
+
+func pkgToMapper(ctx context.Context, view View, pkg Package, uri span.URI) (*ast.File, *protocol.ColumnMapper, error) {
+	var ph ParseGoHandle
+	for _, h := range pkg.GetHandles() {
+		if h.File().Identity().URI == uri {
+			ph = h
+		}
+	}
+	file, err := ph.Cached(ctx)
+	if file == nil {
+		return nil, nil, err
+	}
+	data, _, err := ph.File().Read(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	fset := view.Session().Cache().FileSet()
+	tok := fset.File(file.Pos())
+	if tok == nil {
+		return nil, nil, errors.Errorf("no token.File for %s", uri)
+	}
+	return file, protocol.NewColumnMapper(uri, uri.Filename(), fset, tok, data), nil
+}
+
+func builtinFileToMapper(ctx context.Context, view View, f GoFile, file *ast.File) (*ast.File, *protocol.ColumnMapper, error) {
+	fh := f.Handle(ctx)
+	data, _, err := fh.Read(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	fset := view.Session().Cache().FileSet()
+	tok := fset.File(file.Pos())
+	if tok == nil {
+		return nil, nil, errors.Errorf("no token.File for %s", f.URI())
+	}
+	return nil, protocol.NewColumnMapper(f.URI(), f.URI().Filename(), fset, tok, data), nil
 }
 
 func IsGenerated(ctx context.Context, view View, uri span.URI) bool {
@@ -71,6 +178,59 @@ func IsGenerated(ctx context.Context, view View, uri span.URI) bool {
 		}
 	}
 	return false
+}
+
+func nodeToProtocolRange(ctx context.Context, view View, n ast.Node) (protocol.Range, error) {
+	mrng, err := nodeToMappedRange(ctx, view, n)
+	if err != nil {
+		return protocol.Range{}, err
+	}
+	return mrng.Range()
+}
+
+func objToMappedRange(ctx context.Context, view View, obj types.Object) (mappedRange, error) {
+	if pkgName, ok := obj.(*types.PkgName); ok {
+		// An imported Go package has a package-local, unqualified name.
+		// When the name matches the imported package name, there is no
+		// identifier in the import spec with the local package name.
+		//
+		// For example:
+		// 		import "go/ast" 	// name "ast" matches package name
+		// 		import a "go/ast"  	// name "a" does not match package name
+		//
+		// When the identifier does not appear in the source, have the range
+		// of the object be the point at the beginning of the declaration.
+		if pkgName.Imported().Name() == pkgName.Name() {
+			return nameToMappedRange(ctx, view, obj.Pos(), "")
+		}
+	}
+	return nameToMappedRange(ctx, view, obj.Pos(), obj.Name())
+}
+
+func nameToMappedRange(ctx context.Context, view View, pos token.Pos, name string) (mappedRange, error) {
+	return posToRange(ctx, view, pos, pos+token.Pos(len(name)))
+}
+
+func nodeToMappedRange(ctx context.Context, view View, n ast.Node) (mappedRange, error) {
+	return posToRange(ctx, view, n.Pos(), n.End())
+}
+
+func posToRange(ctx context.Context, view View, pos, end token.Pos) (mappedRange, error) {
+	if !pos.IsValid() {
+		return mappedRange{}, errors.Errorf("invalid position for %v", pos)
+	}
+	if !end.IsValid() {
+		return mappedRange{}, errors.Errorf("invalid position for %v", end)
+	}
+	posn := view.Session().Cache().FileSet().Position(pos)
+	_, m, err := cachedFileToMapper(ctx, view, span.FileURI(posn.Filename))
+	if err != nil {
+		return mappedRange{}, err
+	}
+	return mappedRange{
+		m:         m,
+		spanRange: span.NewRange(view.Session().Cache().FileSet(), pos, end),
+	}, nil
 }
 
 // Matches cgo generated comment as well as the proposed standard:

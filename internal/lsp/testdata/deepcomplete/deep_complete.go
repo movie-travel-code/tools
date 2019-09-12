@@ -4,7 +4,7 @@
 
 package deepcomplete
 
-import "context" //@item(ctxPackage, "context", "\"context\"", "package")
+import "context"
 
 type deepA struct {
 	b deepB //@item(deepBField, "b", "deepB", "field")
@@ -26,20 +26,20 @@ func _() {
 func wantsContext(context.Context) {}
 
 func _() {
-	context.Background()             //@item(ctxBackground, "context.Background", "func() context.Context", "func", "Background returns a non-nil, empty Context.")
-	context.TODO()                   //@item(ctxTODO, "context.TODO", "func() context.Context", "func", "TODO returns a non-nil, empty Context.")
-	context.WithValue(nil, nil, nil) //@item(ctxWithValue, "context.WithValue", "func(parent context.Context, key interface{}, val interface{}) context.Context", "func", "WithValue returns a copy of parent in which the value associated with key is val.")
+	context.Background() //@item(ctxBackground, "context.Background", "func() context.Context", "func", "Background returns a non-nil, empty Context.")
+	context.TODO()       //@item(ctxTODO, "context.TODO", "func() context.Context", "func", "TODO returns a non-nil, empty Context.")
 
-	wantsContext(c) //@complete(")", ctxBackground, ctxTODO, ctxWithValue, ctxPackage)
+	wantsContext(c) //@completePartial(")", ctxBackground, ctxTODO)
 }
 
 func _() {
-	type deepCircle struct { //@item(deepCircleStruct, "deepCircle", "struct{...}", "struct")
+	// deepCircle is circular.
+	type deepCircle struct {
 		*deepCircle
 	}
 	var circle deepCircle   //@item(deepCircle, "circle", "deepCircle", "var")
-	circle.deepCircle       //@item(deepCircleField, "circle.deepCircle", "*deepCircle", "field")
-	var _ deepCircle = circ //@complete(" //", deepCircle, deepCircleStruct, deepCircleField)
+	circle.deepCircle       //@item(deepCircleField, "circle.deepCircle", "*deepCircle", "field", "deepCircle is circular.")
+	var _ deepCircle = circ //@complete(" //", deepCircle, deepCircleField)
 }
 
 func _() {
@@ -69,4 +69,22 @@ func _() {
 	nested{
 		a: 123, //@complete(" //", deepNestedField)
 	}
+}
+
+func _() {
+	var a struct {
+		b struct {
+			c int
+		}
+		d int
+	}
+
+	a.d   //@item(deepAD, "a.d", "int", "field")
+	a.b.c //@item(deepABC, "a.b.c", "int", "field")
+	a.b   //@item(deepAB, "a.b", "struct{...}", "field")
+	a     //@item(deepA, "a", "struct{...}", "var")
+
+	// "a.d" should be ranked above the deeper "a.b.c"
+	var i int
+	i = a //@complete(" //", deepAD, deepABC, deepA, deepAB)
 }

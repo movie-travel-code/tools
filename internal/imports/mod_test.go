@@ -15,8 +15,20 @@ import (
 	"testing"
 
 	"golang.org/x/tools/internal/module"
+	"golang.org/x/tools/internal/testenv"
 	"golang.org/x/tools/internal/txtar"
 )
+
+// Tests that we can find packages in the stdlib.
+func TestScanStdlib(t *testing.T) {
+	mt := setup(t, `
+-- go.mod --
+module x
+`, "")
+	defer mt.cleanup()
+
+	mt.assertScanFinds("fmt", "fmt")
+}
 
 // Tests that we handle a nested module. This is different from other tests
 // where the module is in scope -- here we have to figure out the import path
@@ -137,6 +149,25 @@ import _ "example.com"
 
 }
 
+// Tests that scanning the module cache > 1 time is able to find the same module
+// in the module cache.
+func TestModMultipleScansWithSubdirs(t *testing.T) {
+	mt := setup(t, `
+-- go.mod --
+module x
+
+require rsc.io/quote v1.5.2
+
+-- x.go --
+package x
+import _ "rsc.io/quote"
+`, "")
+	defer mt.cleanup()
+
+	mt.assertScanFinds("rsc.io/quote/buggy", "buggy")
+	mt.assertScanFinds("rsc.io/quote/buggy", "buggy")
+}
+
 // Tests that scanning the module cache > 1 after changing a package in module cache to make it unimportable
 // is able to find the same module.
 func TestModCacheEditModFile(t *testing.T) {
@@ -151,6 +182,9 @@ import _ "rsc.io/quote"
 `, "")
 	defer mt.cleanup()
 	found := mt.assertScanFinds("rsc.io/quote", "quote")
+	if found == nil {
+		t.Fatal("rsc.io/quote not found in initial scan.")
+	}
 
 	// Update the go.mod file of example.com so that it changes its module path (not allowed).
 	if err := os.Chmod(filepath.Join(found.dir, "go.mod"), 0644); err != nil {
@@ -176,7 +210,6 @@ import _ "rsc.io/quote"
 	mt.resolver.Main = nil
 	mt.resolver.ModsByModPath = nil
 	mt.resolver.ModsByDir = nil
-	mt.resolver.ModCachePkgs = nil
 	mt.assertScanFinds("rsc.io/quote", "quote")
 
 }
@@ -553,10 +586,12 @@ type modTest struct {
 	cleanup  func()
 }
 
-// setup builds a test enviroment from a txtar and supporting modules
+// setup builds a test environment from a txtar and supporting modules
 // in testdata/mod, along the lines of TestScript in cmd/go.
 func setup(t *testing.T, main, wd string) *modTest {
 	t.Helper()
+	testenv.NeedsTool(t, "go")
+
 	proxyOnce.Do(func() {
 		var err error
 		proxyDir, err = ioutil.TempDir("", "proxy-")
@@ -602,18 +637,7 @@ func setup(t *testing.T, main, wd string) *modTest {
 		T:        t,
 		env:      env,
 		resolver: &ModuleResolver{env: env},
-		cleanup: func() {
-			_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-				if err != nil {
-					return nil
-				}
-				if info.IsDir() {
-					_ = os.Chmod(path, 0777)
-				}
-				return nil
-			})
-			_ = os.RemoveAll(dir) // ignore errors
-		},
+		cleanup:  func() { removeDir(dir) },
 	}
 }
 
@@ -711,4 +735,64 @@ func writeProxyModule(base, arPath string) error {
 		return err
 	}
 	return nil
+}
+
+func removeDir(dir string) {
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			_ = os.Chmod(path, 0777)
+		}
+		return nil
+	})
+	_ = os.RemoveAll(dir) // ignore errors
+}
+
+// Tests that findModFile can find the mod files from a path in the module cache.
+func TestFindModFileModCache(t *testing.T) {
+	mt := setup(t, `
+-- go.mod --
+module x
+
+require rsc.io/quote v1.5.2
+-- x.go --
+package x
+import _ "rsc.io/quote"
+`, "")
+	defer mt.cleanup()
+	want := filepath.Join(mt.resolver.env.GOPATH, "pkg/mod", "rsc.io/quote@v1.5.2", "go.mod")
+
+	found := mt.assertScanFinds("rsc.io/quote", "quote")
+	modFile := mt.resolver.findModFile(found.dir)
+	if modFile != want {
+		t.Errorf("expected: %s, got: %s", want, modFile)
+	}
+}
+
+// Tests that crud in the module cache is ignored.
+func TestInvalidModCache(t *testing.T) {
+	dir, err := ioutil.TempDir("", t.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removeDir(dir)
+
+	// This doesn't have module@version like it should.
+	if err := os.MkdirAll(filepath.Join(dir, "gopath/pkg/mod/sabotage"), 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := ioutil.WriteFile(filepath.Join(dir, "gopath/pkg/mod/sabotage/x.go"), []byte("package foo\n"), 0777); err != nil {
+		t.Fatal(err)
+	}
+	env := &ProcessEnv{
+		GOROOT:      build.Default.GOROOT,
+		GOPATH:      filepath.Join(dir, "gopath"),
+		GO111MODULE: "on",
+		GOSUMDB:     "off",
+		WorkingDir:  dir,
+	}
+	resolver := &ModuleResolver{env: env}
+	resolver.scan(nil)
 }

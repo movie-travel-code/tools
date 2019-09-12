@@ -35,7 +35,6 @@ import (
 	"golang.org/x/tools/go/analysis/passes/unsafeptr"
 	"golang.org/x/tools/go/analysis/passes/unusedresult"
 	"golang.org/x/tools/go/packages"
-	"golang.org/x/tools/internal/lsp/diff"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/telemetry"
 	"golang.org/x/tools/internal/span"
@@ -51,12 +50,12 @@ type Diagnostic struct {
 	Source   string
 	Severity DiagnosticSeverity
 
-	SuggestedFixes []SuggestedFixes
+	SuggestedFixes []SuggestedFix
 }
 
-type SuggestedFixes struct {
+type SuggestedFix struct {
 	Title string
-	Edits []diff.TextEdit
+	Edits []protocol.TextEdit
 }
 
 type DiagnosticSeverity int
@@ -70,9 +69,21 @@ func Diagnostics(ctx context.Context, view View, f GoFile, disabledAnalyses map[
 	ctx, done := trace.StartSpan(ctx, "source.Diagnostics", telemetry.File.Of(f.URI()))
 	defer done()
 
-	cph, err := f.GetCheckPackageHandle(ctx)
+	cphs, err := f.GetCheckPackageHandles(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// Use the "biggest" package we know about.
+	// If we know about a package and its in-package tests,
+	// we should send diagnostics for both.
+	var cph CheckPackageHandle
+	for _, h := range cphs {
+		if cph == nil || len(h.Files()) > len(cph.Files()) {
+			cph = h
+		}
+	}
+	if cph == nil {
+		return nil, errors.Errorf("no package for file %s", f.URI())
 	}
 	pkg, err := cph.Check(ctx)
 	if err != nil {
@@ -241,7 +252,7 @@ func toDiagnostic(ctx context.Context, view View, diag analysis.Diagnostic, cate
 	if diag.Category != "" {
 		category += "." + category
 	}
-	ca, err := getCodeActions(view.Session().Cache().FileSet(), diag)
+	ca, err := getCodeActions(ctx, view, diag)
 	if err != nil {
 		return Diagnostic{}, err
 	}
@@ -387,7 +398,7 @@ func runAnalyses(ctx context.Context, view View, cph CheckPackageHandle, disable
 		if err != nil {
 			return err
 		}
-		pkg.SetDiagnostics(sdiags)
+		pkg.SetDiagnostics(r.Analyzer, sdiags)
 	}
 	return nil
 }

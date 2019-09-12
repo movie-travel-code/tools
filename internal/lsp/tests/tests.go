@@ -29,16 +29,19 @@ import (
 // We hardcode the expected number of test cases to ensure that all tests
 // are being executed. If a test is added, this number must be changed.
 const (
-	ExpectedCompletionsCount       = 146
-	ExpectedCompletionSnippetCount = 15
+	ExpectedCompletionsCount       = 160
+	ExpectedCompletionSnippetCount = 16
 	ExpectedDiagnosticsCount       = 21
 	ExpectedFormatCount            = 6
 	ExpectedImportCount            = 2
+	ExpectedSuggestedFixCount      = 1
 	ExpectedDefinitionsCount       = 39
 	ExpectedTypeDefinitionsCount   = 2
+	ExpectedFoldingRangesCount     = 2
 	ExpectedHighlightsCount        = 2
-	ExpectedReferencesCount        = 5
+	ExpectedReferencesCount        = 6
 	ExpectedRenamesCount           = 20
+	ExpectedPrepareRenamesCount    = 8
 	ExpectedSymbolsCount           = 1
 	ExpectedSignaturesCount        = 21
 	ExpectedLinksCount             = 4
@@ -55,16 +58,19 @@ var updateGolden = flag.Bool("golden", false, "Update golden files")
 
 type Diagnostics map[span.URI][]source.Diagnostic
 type CompletionItems map[token.Pos]*source.CompletionItem
-type Completions map[span.Span][]token.Pos
+type Completions map[span.Span]Completion
 type CompletionSnippets map[span.Span]CompletionSnippet
+type FoldingRanges []span.Span
 type Formats []span.Span
 type Imports []span.Span
+type SuggestedFixes []span.Span
 type Definitions map[span.Span]Definition
 type Highlights map[string][]span.Span
 type References map[span.Span][]span.Span
 type Renames map[span.Span]string
-type Symbols map[span.URI][]source.Symbol
-type SymbolsChildren map[string][]source.Symbol
+type PrepareRenames map[span.Span]*source.PrepareItem
+type Symbols map[span.URI][]protocol.DocumentSymbol
+type SymbolsChildren map[string][]protocol.DocumentSymbol
 type Signatures map[span.Span]*source.SignatureInformation
 type Links map[span.URI][]Link
 
@@ -75,12 +81,15 @@ type Data struct {
 	CompletionItems    CompletionItems
 	Completions        Completions
 	CompletionSnippets CompletionSnippets
+	FoldingRanges      FoldingRanges
 	Formats            Formats
 	Imports            Imports
+	SuggestedFixes     SuggestedFixes
 	Definitions        Definitions
 	Highlights         Highlights
 	References         References
 	Renames            Renames
+	PrepareRenames     PrepareRenames
 	Symbols            Symbols
 	symbolsChildren    SymbolsChildren
 	Signatures         Signatures
@@ -95,12 +104,15 @@ type Data struct {
 type Tests interface {
 	Diagnostics(*testing.T, Diagnostics)
 	Completion(*testing.T, Completions, CompletionSnippets, CompletionItems)
+	FoldingRange(*testing.T, FoldingRanges)
 	Format(*testing.T, Formats)
 	Import(*testing.T, Imports)
+	SuggestedFix(*testing.T, SuggestedFixes)
 	Definition(*testing.T, Definitions)
 	Highlight(*testing.T, Highlights)
 	Reference(*testing.T, References)
 	Rename(*testing.T, Renames)
+	PrepareRename(*testing.T, PrepareRenames)
 	Symbol(*testing.T, Symbols)
 	SignatureHelp(*testing.T, Signatures)
 	Link(*testing.T, Links)
@@ -108,10 +120,24 @@ type Tests interface {
 
 type Definition struct {
 	Name      string
-	Src       span.Span
 	IsType    bool
 	OnlyHover bool
-	Def       span.Span
+	Src, Def  span.Span
+}
+
+type CompletionTestType int
+
+const (
+	// Full means candidates in test must match full list of candidates.
+	CompletionFull CompletionTestType = iota
+
+	// Partial means candidates in test must be valid and in the right relative order.
+	CompletionPartial
+)
+
+type Completion struct {
+	CompletionItems []token.Pos
+	Type            CompletionTestType
 }
 
 type CompletionSnippet struct {
@@ -148,6 +174,7 @@ func Load(t testing.TB, exporter packagestest.Exporter, dir string) *Data {
 		Highlights:         make(Highlights),
 		References:         make(References),
 		Renames:            make(Renames),
+		PrepareRenames:     make(PrepareRenames),
 		Symbols:            make(Symbols),
 		symbolsChildren:    make(SymbolsChildren),
 		Signatures:         make(Signatures),
@@ -220,21 +247,25 @@ func Load(t testing.TB, exporter packagestest.Exporter, dir string) *Data {
 
 	// Collect any data that needs to be used by subsequent tests.
 	if err := data.Exported.Expect(map[string]interface{}{
-		"diag":      data.collectDiagnostics,
-		"item":      data.collectCompletionItems,
-		"complete":  data.collectCompletions,
-		"format":    data.collectFormats,
-		"import":    data.collectImports,
-		"godef":     data.collectDefinitions,
-		"typdef":    data.collectTypeDefinitions,
-		"hover":     data.collectHoverDefinitions,
-		"highlight": data.collectHighlights,
-		"refs":      data.collectReferences,
-		"rename":    data.collectRenames,
-		"symbol":    data.collectSymbols,
-		"signature": data.collectSignatures,
-		"snippet":   data.collectCompletionSnippets,
-		"link":      data.collectLinks,
+		"diag":            data.collectDiagnostics,
+		"item":            data.collectCompletionItems,
+		"complete":        data.collectCompletions(CompletionFull),
+		"completePartial": data.collectCompletions(CompletionPartial),
+		"fold":            data.collectFoldingRanges,
+		"format":          data.collectFormats,
+		"import":          data.collectImports,
+		"godef":           data.collectDefinitions,
+		"typdef":          data.collectTypeDefinitions,
+		"hover":           data.collectHoverDefinitions,
+		"highlight":       data.collectHighlights,
+		"refs":            data.collectReferences,
+		"rename":          data.collectRenames,
+		"prepare":         data.collectPrepareRenames,
+		"symbol":          data.collectSymbols,
+		"signature":       data.collectSignatures,
+		"snippet":         data.collectCompletionSnippets,
+		"link":            data.collectLinks,
+		"suggestedfix":    data.collectSuggestedFixes,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -279,6 +310,14 @@ func Run(t *testing.T, tests Tests, data *Data) {
 		tests.Diagnostics(t, data.Diagnostics)
 	})
 
+	t.Run("FoldingRange", func(t *testing.T) {
+		t.Helper()
+		if len(data.FoldingRanges) != ExpectedFoldingRangesCount {
+			t.Errorf("got %v folding ranges expected %v", len(data.FoldingRanges), ExpectedFoldingRangesCount)
+		}
+		tests.FoldingRange(t, data.FoldingRanges)
+	})
+
 	t.Run("Format", func(t *testing.T) {
 		t.Helper()
 		if len(data.Formats) != ExpectedFormatCount {
@@ -293,6 +332,14 @@ func Run(t *testing.T, tests Tests, data *Data) {
 			t.Errorf("got %v imports expected %v", len(data.Imports), ExpectedImportCount)
 		}
 		tests.Import(t, data.Imports)
+	})
+
+	t.Run("SuggestedFix", func(t *testing.T) {
+		t.Helper()
+		if len(data.SuggestedFixes) != ExpectedSuggestedFixCount {
+			t.Errorf("got %v suggested fixes expected %v", len(data.SuggestedFixes), ExpectedSuggestedFixCount)
+		}
+		tests.SuggestedFix(t, data.SuggestedFixes)
 	})
 
 	t.Run("Definition", func(t *testing.T) {
@@ -325,6 +372,15 @@ func Run(t *testing.T, tests Tests, data *Data) {
 			t.Errorf("got %v renames expected %v", len(data.Renames), ExpectedRenamesCount)
 		}
 		tests.Rename(t, data.Renames)
+	})
+
+	t.Run("PrepareRenames", func(t *testing.T) {
+		t.Helper()
+		if len(data.PrepareRenames) != ExpectedPrepareRenamesCount {
+			t.Errorf("got %v prepare renames expected %v", len(data.PrepareRenames), ExpectedPrepareRenamesCount)
+		}
+
+		tests.PrepareRename(t, data.PrepareRenames)
 	})
 
 	t.Run("Symbols", func(t *testing.T) {
@@ -527,8 +583,13 @@ func summarizeDiagnostics(i int, want []source.Diagnostic, got []source.Diagnost
 	return msg.String()
 }
 
-func (data *Data) collectCompletions(src span.Span, expected []token.Pos) {
-	data.Completions[src] = expected
+func (data *Data) collectCompletions(typ CompletionTestType) func(span.Span, []token.Pos) {
+	return func(src span.Span, expected []token.Pos) {
+		data.Completions[src] = Completion{
+			CompletionItems: expected,
+			Type:            typ,
+		}
+	}
 }
 
 func (data *Data) collectCompletionItems(pos token.Pos, args []string) {
@@ -548,12 +609,20 @@ func (data *Data) collectCompletionItems(pos token.Pos, args []string) {
 	}
 }
 
+func (data *Data) collectFoldingRanges(spn span.Span) {
+	data.FoldingRanges = append(data.FoldingRanges, spn)
+}
+
 func (data *Data) collectFormats(spn span.Span) {
 	data.Formats = append(data.Formats, spn)
 }
 
 func (data *Data) collectImports(spn span.Span) {
 	data.Imports = append(data.Imports, spn)
+}
+
+func (data *Data) collectSuggestedFixes(spn span.Span) {
+	data.SuggestedFixes = append(data.SuggestedFixes, spn)
 }
 
 func (data *Data) collectDefinitions(src, target span.Span) {
@@ -597,11 +666,47 @@ func (data *Data) collectRenames(src span.Span, newText string) {
 	data.Renames[src] = newText
 }
 
+func (data *Data) collectPrepareRenames(src span.Span, rng span.Range, placeholder string) {
+	if int(rng.End-rng.Start) != len(placeholder) {
+		// If the length of the placeholder and the length of the range do not match,
+		// make the range just be the start.
+		rng = span.NewRange(rng.FileSet, rng.Start, rng.Start)
+	}
+	contents, err := data.Exported.FileContents(src.URI().Filename())
+	if err != nil {
+		return
+	}
+	m := protocol.NewColumnMapper(src.URI(), src.URI().Filename(), data.Exported.ExpectFileSet, nil, contents)
+
+	// Convert range to span and then to protocol.Range.
+	spn, err := rng.Span()
+	if err != nil {
+		return
+	}
+	prng, err := m.Range(spn)
+	if err != nil {
+		return
+	}
+	data.PrepareRenames[src] = &source.PrepareItem{
+		Range: prng,
+		Text:  placeholder,
+	}
+}
+
 func (data *Data) collectSymbols(name string, spn span.Span, kind string, parentName string) {
-	sym := source.Symbol{
-		Name:          name,
-		Kind:          source.ParseSymbolKind(kind),
-		SelectionSpan: spn,
+	contents, err := data.Exported.FileContents(spn.URI().Filename())
+	if err != nil {
+		return
+	}
+	m := protocol.NewColumnMapper(spn.URI(), spn.URI().Filename(), data.Exported.ExpectFileSet, nil, contents)
+	rng, err := m.Range(spn)
+	if err != nil {
+		return
+	}
+	sym := protocol.DocumentSymbol{
+		Name:           name,
+		Kind:           protocol.ParseSymbolKind(kind),
+		SelectionRange: rng,
 	}
 	if parentName == "" {
 		data.Symbols[spn.URI()] = append(data.Symbols[spn.URI()], sym)
