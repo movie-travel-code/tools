@@ -6,12 +6,11 @@ package lsp
 
 import (
 	"context"
-
+	"golang.org/x/tools/internal/telemetry/log"
 	"os/exec"
 
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/span"
-	"golang.org/x/tools/internal/telemetry/log"
 	errors "golang.org/x/xerrors"
 )
 
@@ -35,15 +34,21 @@ func (s *Server) changeFolders(ctx context.Context, event protocol.WorkspaceFold
 
 func (s *Server) addView(ctx context.Context, name string, uri span.URI) error {
 	options := s.session.Options()
-	if options.InstallGoDependency {
-		cmd := exec.Command("go", "mod", "download")
-		cmd.Dir = uri.Filename()
-		if err := cmd.Run(); err != nil {
-			log.Error(ctx, "failed to download the dependencies", err)
-		}
-	} else {
-		// If we disable the go dependency download, trying to find the deps from the vendor folder.
+	if isPureVendor(uri.Filename()) {
+		modulePath := getModulePath(uri.Filename())
+		constructGoModManually(uri.Filename(), modulePath)
 		ctx = context.WithValue(ctx, "ENABLEVENDOR", true)
+	} else {
+		if options.InstallGoDependency {
+			cmd := exec.Command("go", "mod", "download")
+			cmd.Dir = uri.Filename()
+			if err := cmd.Run(); err != nil {
+				log.Error(ctx, "failed to download the dependencies", err)
+			}
+		} else {
+			// If we disable the go dependency download, trying to find the deps from the vendor folder.
+			ctx = context.WithValue(ctx, "ENABLEVENDOR", true)
+		}
 	}
 	s.stateMu.Lock()
 	state := s.state

@@ -450,6 +450,21 @@ func normalizePath(path, dir, repoURI, depsPath string) string {
 	return strings.TrimPrefix(path, string(filepath.Separator))
 }
 
+var (
+	importCommentRE         = regexp.MustCompile(`(?m)^package[ \t]+[^ \t\r\n/]+[ \t]+//[ \t]+import[ \t]+(\"[^"]+\")[ \t]*\r?\n`)
+	DependencyControlSystem = []string{
+		"GLOCKFILE",
+		"Godeps/Godeps.json",
+		"Gopkg.lock",
+		"dependencies.tsv",
+		"glide.lock",
+		"vendor.conf",
+		"vendor.yml",
+		"vendor/manifest",
+		"vendor/vendor.json",
+	}
+)
+
 // ModuleConverter serves the following two purposes:
 // - Convert the folder to module to get rid of the '$GOPATH/src' limitation.
 // - Recognize the potential multi-module cases.
@@ -460,11 +475,165 @@ type ModuleConverter struct {
 	FolderNeedsCleanup []string
 }
 
-var (
-	importCommentRE = regexp.MustCompile(`(?m)^package[ \t]+[^ \t\r\n/]+[ \t]+//[ \t]+import[ \t]+(\"[^"]+\")[ \t]*\r?\n`)
-)
-
 func (metadata *ModuleConverter) goModInit(folder string) error {
+	// For the folders which have pure vendor folder, delay the 'go.mod' construction into initialize handler.
+	if isPureVendor(folder) {
+		metadata.FolderNeedsCleanup = append(metadata.FolderNeedsCleanup, folder)
+		return nil
+	}
+	modulePath := getModulePath(folder)
+	if metadata.installGoDeps {
+		cmd := exec.Command("go", "mod", "init", modulePath)
+		cmd.Dir = folder
+		return cmd.Run()
+	} else {
+		metadata.FolderNeedsCleanup = append(metadata.FolderNeedsCleanup, folder)
+		return constructGoModManually(folder, modulePath)
+	}
+}
+
+// collectWorkspaceFolderMetadata explores the workspace folder to collects the meta information of the folder. And
+// create a new 'go.mod' if necessary to cover all the source files.
+func (metadata *ModuleConverter) collectMetadata(ctx context.Context) error {
+	// Collect 'go.mod' and record them as workspace folders.
+	if err := filepath.Walk(metadata.folder, func(path string, info os.FileInfo, err error) error {
+		base := filepath.Base(path)
+		if (base[0] == '.' || base == "vendor") && info.IsDir() {
+			return filepath.SkipDir
+		} else if info.Name() == "go.mod" {
+			dir := filepath.Dir(path)
+			metadata.moduleFolders = append(metadata.moduleFolders, dir)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	folderUncovered, folderNeedMod, err := collectUncoveredSrc(metadata.folder)
+	if err != nil {
+		return nil
+	}
+	// If folders need to be covered exist, a new 'go.mod' will be created manually.
+	if len(folderUncovered) > 0 {
+		longestPrefix := string(filepath.Separator)
+		// Compute the longest common prefix of the folders which need to be covered by 'go.mod'.
+	DONE:
+		for i, name := range folderUncovered[0] {
+			same := true
+			for _, folder := range folderUncovered[1:] {
+				if len(folder) <= i || folder[i] != name {
+					same = false
+					break DONE
+				}
+			}
+			if same {
+				longestPrefix = filepath.Join(longestPrefix, name)
+			}
+		}
+		folderNeedMod = append(folderNeedMod, filepath.Clean(longestPrefix))
+	}
+
+	for _, folder := range folderNeedMod {
+		if err := metadata.goModInit(folder); err != nil {
+			log.Error(ctx, "error when initializing module", err, telemetry.File)
+			continue
+		}
+		metadata.moduleFolders = append(metadata.moduleFolders, folder)
+	}
+	return nil
+}
+
+// collectUncoveredSrc explores the rootPath recursively, collects
+//  - folders need to be covered, which we will create a module to cover all these folders.
+//  - folders need to create a module.
+func collectUncoveredSrc(path string) ([][]string, []string, error) {
+	var folderUncovered [][]string
+	var folderNeedMod []string
+	if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+		return nil, nil, nil
+	}
+	// existDepControlFile determines if dependency control files exist in the specified folder.
+	existDepControlFile := func(dir string) bool {
+		for _, name := range DependencyControlSystem {
+			if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+				return true
+			}
+		}
+		return false
+	}
+	// Given that we have to respect the original dependency control data, if there is a dependency control file, we
+	// we will create a 'go.mod' accordingly.
+	if existDepControlFile(path) {
+		folderNeedMod = append(folderNeedMod, path)
+		return nil, folderNeedMod, nil
+	}
+	if _, err := os.Stat(filepath.Join(path, "vendor")); err == nil {
+		folderNeedMod = append(folderNeedMod, path)
+		return nil, folderNeedMod, nil
+	}
+	// If there are remaining '.go' source files under the current folder, that means they will not be covered by
+	// any 'go.mod'.
+	shouldBeCovered := false
+	fileInfo, err := ioutil.ReadDir(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, info := range fileInfo {
+		if !shouldBeCovered && filepath.Ext(info.Name()) == ".go" && !strings.HasSuffix(info.Name(), "_test.go") {
+			shouldBeCovered = true
+		}
+		if info.IsDir() && info.Name()[0] != '.' {
+			uncovered, mod, e := collectUncoveredSrc(filepath.Join(path, info.Name()))
+			folderNeedMod = append(folderNeedMod, mod...)
+			folderUncovered = append(folderUncovered, uncovered...)
+			err = e
+		}
+	}
+	if shouldBeCovered {
+		folderUncovered = append(folderUncovered, strings.Split(path, string(filepath.Separator)))
+	}
+	return folderUncovered, folderNeedMod, err
+}
+
+func constructDetailSymbol(s *ElasticServer, ctx context.Context, params *protocol.DocumentSymbolParams, pkgLocator *protocol.PackageLocator) (detailSyms []protocol.DetailSymbolInformation, err error) {
+	docSyms, err := (*Server).DocumentSymbol(&s.Server, ctx, params)
+
+	var flattenDocumentSymbol func(*[]protocol.DocumentSymbol, string, string)
+	// Note: The reason why we construct the qname during the flatten process is that we can't construct the qname
+	// through the 'SymbolInformation.ContainerName' because of the possibilities of the 'ContainerName' collision.
+	flattenDocumentSymbol = func(symbols *[]protocol.DocumentSymbol, prefix string, container string) {
+		for _, symbol := range *symbols {
+			sym := protocol.SymbolInformation{
+				Name:          symbol.Name,
+				Kind:          symbol.Kind,
+				Deprecated:    symbol.Deprecated,
+				ContainerName: container,
+				Location: protocol.Location{
+					URI:   params.TextDocument.URI,
+					Range: symbol.SelectionRange,
+				},
+			}
+			var qnamePrefix string
+			if prefix != "" {
+				qnamePrefix = prefix + "." + symbol.Name
+			} else {
+				qnamePrefix = symbol.Name
+			}
+			detailSyms = append(detailSyms, protocol.DetailSymbolInformation{
+				Symbol:  sym,
+				Qname:   pkgLocator.Name + "." + qnamePrefix,
+				Package: *pkgLocator,
+			})
+			if len(symbol.Children) > 0 {
+				flattenDocumentSymbol(&symbol.Children, qnamePrefix, symbol.Name)
+			}
+		}
+	}
+
+	flattenDocumentSymbol(&docSyms, "", "")
+	return
+}
+
+func getModulePath(folder string) string {
 	// findModulePath is copied from 'go/src/cmd/go/internal/modload/init.go'.
 	// TODO(henrywong) The best approach to guess the module path is `go mod init`, see
 	//  https://github.com/golang/go/blob/release-branch.go1.12/src/cmd/go/alldocs.go#L1040. However in order to get rid
@@ -532,7 +701,8 @@ func (metadata *ModuleConverter) goModInit(folder string) error {
 		msg := `cannot determine module path for source directory %s (outside GOPATH, module path must be specified)`
 		return "", fmt.Errorf(msg, folder)
 	}
-	constructModulePath := func() (modulePath string) {
+	modulePath, err := findModulePath()
+	if err != nil {
 		list := strings.Split(folder, string(filepath.Separator)+"__")
 		if len(list) != 2 {
 			return folder
@@ -545,184 +715,42 @@ func (metadata *ModuleConverter) goModInit(folder string) error {
 		// concatenate 'code host/owner/repo'
 		modulePath = strings.Join(prefixList[len(prefixList)-3:], "/")
 		if len(suffixList) < 3 {
-			return
+			return modulePath
 		}
 		// Skip the dummy hash folder and branch name, concatenates remain elements for the submodule cases.
 		modulePath = strings.Join(append([]string{modulePath}, suffixList[2:]...), "/")
-		return
 	}
-	modulePath, err := findModulePath()
-	if err != nil {
-		// If guess failed, try to construct the module path by our own.
-		modulePath = constructModulePath()
-	}
-	if metadata.installGoDeps {
-		cmd := exec.Command("go", "mod", "init", modulePath)
-		cmd.Dir = folder
-		return cmd.Run()
-	} else {
-		if _, err := os.Stat(filepath.Join(folder, "go.mod")); err == nil {
-			return nil
-		}
-		// construct the 'go.mod' manually.
-		goMod, err := os.Create(filepath.Join(folder, "go.mod"))
-		if err != nil {
-			return err
-		}
-		defer goMod.Close()
-		data := "module " + modulePath
-		if _, err := goMod.WriteString(data); err != nil {
-			return err
-		}
-		metadata.FolderNeedsCleanup = append(metadata.FolderNeedsCleanup, folder)
-		return nil
-	}
+	return modulePath
 }
 
-// collectWorkspaceFolderMetadata explores the workspace folder to collects the meta information of the folder. And
-// create a new 'go.mod' if necessary to cover all the source files.
-func (metadata *ModuleConverter) collectMetadata(ctx context.Context) error {
-	// Collect 'go.mod' and record them as workspace folders.
-	if err := filepath.Walk(metadata.folder, func(path string, info os.FileInfo, err error) error {
-		base := filepath.Base(path)
-		if (base[0] == '.' || base == "vendor") && info.IsDir() {
-			return filepath.SkipDir
-		} else if info.Name() == "go.mod" {
-			dir := filepath.Dir(path)
-			metadata.moduleFolders = append(metadata.moduleFolders, dir)
-		}
+func constructGoModManually(folder string, modulePath string) error {
+	if _, err := os.Stat(filepath.Join(folder, "go.mod")); err == nil {
 		return nil
-	}); err != nil {
+	}
+	// construct the 'go.mod' manually.
+	goMod, err := os.Create(filepath.Join(folder, "go.mod"))
+	if err != nil {
 		return err
 	}
-	folderUncovered, folderNeedMod, err := collectUncoveredSrc(metadata.folder)
-	if err != nil {
-		return nil
-	}
-	// If folders need to be covered exist, a new 'go.mod' will be created manually.
-	if len(folderUncovered) > 0 {
-		longestPrefix := string(filepath.Separator)
-		// Compute the longest common prefix of the folders which need to be covered by 'go.mod'.
-	DONE:
-		for i, name := range folderUncovered[0] {
-			same := true
-			for _, folder := range folderUncovered[1:] {
-				if len(folder) <= i || folder[i] != name {
-					same = false
-					break DONE
-				}
-			}
-			if same {
-				longestPrefix = filepath.Join(longestPrefix, name)
-			}
-		}
-		folderNeedMod = append(folderNeedMod, filepath.Clean(longestPrefix))
-	}
-
-	for _, folder := range folderNeedMod {
-		if err := metadata.goModInit(folder); err != nil {
-			log.Error(ctx, "error when initializing module", err, telemetry.File)
-			continue
-		}
-		metadata.moduleFolders = append(metadata.moduleFolders, folder)
+	defer goMod.Close()
+	data := "module " + modulePath
+	if _, err := goMod.WriteString(data); err != nil {
+		return err
 	}
 	return nil
 }
 
-// collectUncoveredSrc explores the rootPath recursively, collects
-//  - folders need to be covered, which we will create a module to cover all these folders.
-//  - folders need to create a module.
-func collectUncoveredSrc(path string) ([][]string, []string, error) {
-	var DependencyControlSystem = []string{
-		"GLOCKFILE",
-		"Godeps/Godeps.json",
-		"Gopkg.lock",
-		"dependencies.tsv",
-		"glide.lock",
-		"vendor.conf",
-		"vendor.yml",
-		"vendor/manifest",
-		"vendor/vendor.json",
-	}
-	var folderUncovered [][]string
-	var folderNeedMod []string
-	if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
-		return nil, nil, nil
-	}
-	// existDepControlFile determines if dependency control files exist in the specified folder.
-	existDepControlFile := func(dir string) bool {
-		for _, name := range DependencyControlSystem {
-			if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
-				return true
-			}
-		}
+func isPureVendor(folder string) bool {
+	if _, err := os.Stat(filepath.Join(folder, "go.mod")); err == nil {
 		return false
 	}
-	// Given that we have to respect the original dependency control data, if there is a dependency control file, we
-	// we will create a 'go.mod' accordingly.
-	if existDepControlFile(path) {
-		folderNeedMod = append(folderNeedMod, path)
-		return nil, folderNeedMod, nil
-	}
-	// If there are remaining '.go' source files under the current folder, that means they will not be covered by
-	// any 'go.mod'.
-	shouldBeCovered := false
-	fileInfo, err := ioutil.ReadDir(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, info := range fileInfo {
-		if !shouldBeCovered && filepath.Ext(info.Name()) == ".go" && !strings.HasSuffix(info.Name(), "_test.go") {
-			shouldBeCovered = true
-		}
-		if info.IsDir() && info.Name()[0] != '.' {
-			uncovered, mod, e := collectUncoveredSrc(filepath.Join(path, info.Name()))
-			folderNeedMod = append(folderNeedMod, mod...)
-			folderUncovered = append(folderUncovered, uncovered...)
-			err = e
+	for _, name := range DependencyControlSystem {
+		if _, err := os.Stat(filepath.Join(folder, name)); err == nil {
+			return false
 		}
 	}
-	if shouldBeCovered {
-		folderUncovered = append(folderUncovered, strings.Split(path, string(filepath.Separator)))
+	if _, err := os.Stat(filepath.Join(folder, "vendor")); err == nil {
+		return true
 	}
-	return folderUncovered, folderNeedMod, err
-}
-
-func constructDetailSymbol(s *ElasticServer, ctx context.Context, params *protocol.DocumentSymbolParams, pkgLocator *protocol.PackageLocator) (detailSyms []protocol.DetailSymbolInformation, err error) {
-	docSyms, err := (*Server).DocumentSymbol(&s.Server, ctx, params)
-
-	var flattenDocumentSymbol func(*[]protocol.DocumentSymbol, string, string)
-	// Note: The reason why we construct the qname during the flatten process is that we can't construct the qname
-	// through the 'SymbolInformation.ContainerName' because of the possibilities of the 'ContainerName' collision.
-	flattenDocumentSymbol = func(symbols *[]protocol.DocumentSymbol, prefix string, container string) {
-		for _, symbol := range *symbols {
-			sym := protocol.SymbolInformation{
-				Name:          symbol.Name,
-				Kind:          symbol.Kind,
-				Deprecated:    symbol.Deprecated,
-				ContainerName: container,
-				Location: protocol.Location{
-					URI:   params.TextDocument.URI,
-					Range: symbol.SelectionRange,
-				},
-			}
-			var qnamePrefix string
-			if prefix != "" {
-				qnamePrefix = prefix + "." + symbol.Name
-			} else {
-				qnamePrefix = symbol.Name
-			}
-			detailSyms = append(detailSyms, protocol.DetailSymbolInformation{
-				Symbol:  sym,
-				Qname:   pkgLocator.Name + "." + qnamePrefix,
-				Package: *pkgLocator,
-			})
-			if len(symbol.Children) > 0 {
-				flattenDocumentSymbol(&symbol.Children, qnamePrefix, symbol.Name)
-			}
-		}
-	}
-
-	flattenDocumentSymbol(&docSyms, "", "")
-	return
+	return false
 }
