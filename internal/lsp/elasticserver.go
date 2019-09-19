@@ -95,14 +95,14 @@ func (s *ElasticServer) EDefinition(ctx context.Context, params *protocol.Defini
 	}
 	qname := getQName(ctx, f, declObj, kind)
 	declURI := ident.Declaration.URI()
-	declPath := declURI.Filename()
-	pkgLocator, scheme := collectPkgMetadata(declObj.Pkg(), view.Folder().Filename(), declPath)
-	declPath = normalizePath(declPath, view.Folder().Filename(), strings.TrimPrefix(pkgLocator.RepoURI, scheme), pkgMod)
+	declFilePath := declURI.Filename()
+	pkgLocator, scheme := collectPkgMetadata(declObj.Pkg(), view.Folder().Filename(), declFilePath)
+	relDeclFilePath := getRelativePath(declFilePath, view.Folder().Filename(), strings.TrimPrefix(pkgLocator.RepoURI, scheme), pkgMod)
 	loc := protocol.Location{
-		URI:   normalizeLoc(declURI.Filename(), pkgMod, &pkgLocator, declPath),
+		URI:   concatenateURL(declURI.Filename(), pkgMod, &pkgLocator, relDeclFilePath),
 		Range: declRange,
 	}
-	return []protocol.SymbolLocator{{Qname: qname, Kind: kind, Path: declPath, Loc: loc, Package: pkgLocator}}, nil
+	return []protocol.SymbolLocator{{Qname: qname, Kind: kind, Path: relDeclFilePath, Loc: loc, Package: pkgLocator}}, nil
 }
 
 const (
@@ -427,24 +427,39 @@ func getPkgVersionFast(loc string) string {
 	return validVersion[0]
 }
 
-// normalizeLoc concatenates repository URL, package version and file path to get a complete location URL for the
-// location located in the dependencies.
-func normalizeLoc(loc string, depsPath string, pkgLocator *protocol.PackageLocator, path string) string {
+// concatenateURL concatenates repository URL, package version and file path to get a complete location URL for the
+// location located in the dependencies, like 'git://github.com/mongodb/mongo-go-driver/blob/master/bson/raw.go'.
+func concatenateURL(loc string, pkgMod string, pkgLocator *protocol.PackageLocator, path string) string {
 	loc = strings.TrimPrefix(loc, "file://")
-	if strings.HasPrefix(loc, depsPath) {
+	if strings.HasPrefix(loc, pkgMod) {
 		strs := []string{"blob", pkgLocator.Version, path}
 		return pkgLocator.RepoURI + string(filepath.Separator) + filepath.Join(strs...)
 	}
 	return "file://" + loc
 }
 
-// normalizePath trims the workspace folder prefix to get the file path in project. Remove the revision embedded in the
-// path if it exists.
-func normalizePath(path, dir, repoURI, depsPath string) string {
+// getRelativePath trims the workspace folder prefix to get the relative file path in project. Remove the revision
+// embedded in the path if it exists.
+func getRelativePath(path, dir, repoURI, pkgMod string) string {
 	if strings.HasPrefix(path, dir) {
 		path = strings.TrimPrefix(path, dir)
 	} else {
-		path = strings.TrimPrefix(path, filepath.Join(depsPath, repoURI))
+		// Decode the filepath that contains exclamation marks, see https://github.com/golang/go/issues/26456
+		if strings.ContainsRune(path, 33) {
+			list := strings.Split(path, string("!"))
+			for i, str := range list {
+				if i == 0 || len(str) < 1 {
+					continue
+				}
+				var tmp = []byte(str)
+				if 'a' < tmp[0] || tmp[0] < 'z' {
+					tmp[0] = tmp[0] + 'A' - 'a'
+				}
+				list[i] = string(tmp)
+			}
+			path = strings.Join(list, "")
+		}
+		path = strings.TrimPrefix(path, filepath.Join(pkgMod, repoURI))
 		rev := getPkgVersionFast(path)
 		if rev != "" {
 			strs := strings.Split(path, rev)
