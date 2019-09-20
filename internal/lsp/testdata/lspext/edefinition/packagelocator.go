@@ -1,12 +1,24 @@
-package edefinition
+package edefinition //Test fail here, edefinition("def", "edefinition", 4)
 
 import (
-	"fmt"
+	jsoniter "github.com/json-iterator/go"
+	"golang.org/x/tools/internal/lsp/foo"
+	"golang.org/x/tools/internal/lsp/godef/a"
+	"golang.org/x/tools/internal/lsp/godef/b"
+	"golang.org/x/tools/internal/lsp/types"
 )
 
-// There is a bug in this test framework that it can't get the identifier from the imports nonofficial package in the
-// test process. Like can get the identifier 'Println' from "fmt", but can't get the identifier 'Direction' from 'jsonrpc2'.
-func pkgloc() { //@packagelocator("loc", "edefinition", "golang.org/x/tools/internal/lsp/lspext/edefinition")
-	// var d jsonrpc2.Direction
-	fmt.Println(0) //@packagelocator("rintln", "fmt", "fmt")
+func packageLocator() {
+	b.Bar() //@packagelocator("B", "b", "https://go.googlesource.com/tools")
+
+	s := b.S1{} //@packagelocator("S", "b", "https://go.googlesource.com/tools")
+
+	str := a.A //@packagelocator("A", "a", "https://go.googlesource.com/tools")
+
+	var i foo.IntFoo //@packagelocator("I", "foo", "https://go.googlesource.com/tools")
+
+	var bob types.Bob //@packagelocator("B", "types", "https://go.googlesource.com/tools")
+
+	var x types.X
+	x.Bobby() //@packagelocator("B", "types", "https://go.googlesource.com/tools")
 }
