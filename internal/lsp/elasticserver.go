@@ -88,21 +88,32 @@ func (s *ElasticServer) EDefinition(ctx context.Context, params *protocol.Defini
 	if err != nil {
 		return nil, err
 	}
+	// Check whether the definition is in the current view, i.e. workspace folders. One repo may has several workspace folders.
+	if strings.HasPrefix(ident.Declaration.URI().Filename(), view.Folder().Filename()) {
+		// If it is the same-workspace folder jump, return early.
+		return []protocol.SymbolLocator{{
+			Loc: &protocol.Location{
+				URI:   protocol.NewURI(ident.Declaration.URI()),
+				Range: declRange,
+			},
+			Package: protocol.PackageLocator{},
+		}}, nil
+	}
+	// If it is the cross-view jump, only return the qname, symbol kind and package locator.
 	declObj := ident.GetDeclObject()
+	declURI := ident.Declaration.URI()
+	declFile, err := getGoFile(ctx, view, declURI)
+	if err != nil {
+		return nil, err
+	}
 	kind := getSymbolKind(declObj)
 	if kind == 0 {
 		return nil, fmt.Errorf("no corresponding symbol kind for '" + ident.Name + "'")
 	}
-	qname := getQName(ctx, f, declObj, kind)
-	declURI := ident.Declaration.URI()
+	qname := getQName(ctx, declFile, declObj, kind)
 	declPath := declURI.Filename()
-	pkgLocator, scheme := collectPkgMetadata(declObj.Pkg(), view.Folder().Filename(), declPath)
-	declPath = normalizePath(declPath, view.Folder().Filename(), strings.TrimPrefix(pkgLocator.RepoURI, scheme), pkgMod)
-	loc := protocol.Location{
-		URI:   normalizeLoc(declURI.Filename(), pkgMod, &pkgLocator, declPath),
-		Range: declRange,
-	}
-	return []protocol.SymbolLocator{{Qname: qname, Kind: kind, Path: declPath, Loc: loc, Package: pkgLocator}}, nil
+	pkgLocator := collectPkgMetadata(declObj.Pkg(), view.Folder().Filename(), declPath)
+	return []protocol.SymbolLocator{{Qname: qname, Kind: kind, Package: pkgLocator}}, nil
 }
 
 const (
@@ -137,7 +148,7 @@ func (s *ElasticServer) Full(ctx context.Context, fullParams *protocol.FullParam
 	if err != nil {
 		return fullResponse, err
 	}
-	pkgLocator, _ := collectPkgMetadata(pkg.GetTypes(), view.Folder().Filename(), path)
+	pkgLocator := collectPkgMetadata(pkg.GetTypes(), view.Folder().Filename(), path)
 
 	detailSyms, err := constructDetailSymbol(s, ctx, &params, &pkgLocator)
 	if err != nil {
@@ -263,7 +274,7 @@ func getQName(ctx context.Context, f source.GoFile, declObj types.Object, kind p
 		return qname
 	}
 	fh := f.Handle(ctx)
-	fAST, _, _, err := f.View().Session().Cache().ParseGoHandle(fh, source.ParseFull).Parse(ctx)
+	fAST, _, _, err := f.View().Session().Cache().ParseGoHandle(fh, source.ParseExported).Parse(ctx)
 	if err != nil {
 		return ""
 	}
@@ -309,20 +320,6 @@ func getQName(ctx context.Context, f source.GoFile, declObj types.Object, kind p
 
 		case *ast.FuncDecl:
 			f, _ := n.(*ast.FuncDecl)
-			if f.Name != nil && f.Name.Name != qname && (kind == protocol.Method || kind == protocol.Function) {
-				qname = f.Name.Name + "." + qname
-			}
-
-			if f.Name != nil {
-				if kind == protocol.Method || kind == protocol.Function {
-					if f.Name.Name != qname {
-						qname = f.Name.Name + "." + qname
-					}
-				} else {
-					qname = f.Name.Name + "." + qname
-				}
-			}
-
 			// If n is method, add the struct name as a prefix.
 			if f.Recv != nil {
 				var typeName string
@@ -334,20 +331,6 @@ func getQName(ctx context.Context, f source.GoFile, declObj types.Object, kind p
 				}
 				qname = typeName + "." + qname
 			}
-		case *ast.FuncLit:
-			// Considering the function literal is for making the local variable declared in it more unique, the
-			// handling is a little tricky. If the function literal is assigned to a named entity, like variable, it is
-			// better consider the variable name into the qualified name.
-
-			// Check its ancestors to decide where it is located in, like a assignment, variable declaration, or a
-			// return statement.
-			switch astPath[id+2].(type) {
-			case *ast.AssignStmt:
-				as, _ := astPath[id+2].(*ast.AssignStmt)
-				if i, ok := as.Lhs[0].(*ast.Ident); ok {
-					qname = i.Name + "." + qname
-				}
-			}
 		}
 	}
 	if declObj.Pkg() == nil {
@@ -358,26 +341,25 @@ func getQName(ctx context.Context, f source.GoFile, declObj types.Object, kind p
 
 // collectPackageMetadata collects metadata for the packages where the specified symbols located and the scheme, i.e.
 // URL prefix, of the repository which the packages belong to.
-func collectPkgMetadata(pkg *types.Package, dir string, loc string) (protocol.PackageLocator, string) {
+func collectPkgMetadata(pkg *types.Package, dir string, loc string) protocol.PackageLocator {
 	if pkg == nil {
-		return protocol.PackageLocator{}, ""
+		return protocol.PackageLocator{}
 	}
 	pkgLocator := protocol.PackageLocator{
 		Name:    pkg.Name(),
 		RepoURI: pkg.Path(),
 	}
-	// If the location is inside the current project or the location from standard library, there is no need to resolve
-	// the revision.
+	// If the package is located in the standard library, there is no need to resolve the revision.
 	if strings.HasPrefix(loc, dir) || strings.HasPrefix(loc, goRoot) {
-		return pkgLocator, ""
+		return pkgLocator
 	}
 	getPkgVersion(dir, &pkgLocator, loc)
 	repoRoot, err := vcs.RepoRootForImportPath(pkg.Path(), false)
 	if err == nil {
 		pkgLocator.RepoURI = repoRoot.Repo
-		return pkgLocator, strings.TrimSuffix(repoRoot.Repo, repoRoot.Root)
+		return pkgLocator
 	}
-	return pkgLocator, ""
+	return pkgLocator
 }
 
 // getPkgVersion collects the version information for a specified package, the version information will be one of the
@@ -425,34 +407,6 @@ func getPkgVersionFast(loc string) string {
 		return ""
 	}
 	return validVersion[0]
-}
-
-// normalizeLoc concatenates repository URL, package version and file path to get a complete location URL for the
-// location located in the dependencies.
-func normalizeLoc(loc string, depsPath string, pkgLocator *protocol.PackageLocator, path string) string {
-	loc = strings.TrimPrefix(loc, "file://")
-	if strings.HasPrefix(loc, depsPath) {
-		strs := []string{"blob", pkgLocator.Version, path}
-		return pkgLocator.RepoURI + string(filepath.Separator) + filepath.Join(strs...)
-	}
-	return "file://" + loc
-}
-
-// normalizePath trims the workspace folder prefix to get the file path in project. Remove the revision embedded in the
-// path if it exists.
-func normalizePath(path, dir, repoURI, depsPath string) string {
-	if strings.HasPrefix(path, dir) {
-		path = strings.TrimPrefix(path, dir)
-	} else {
-		path = strings.TrimPrefix(path, filepath.Join(depsPath, repoURI))
-		rev := getPkgVersionFast(path)
-		if rev != "" {
-			strs := strings.Split(path, rev)
-			i := strings.LastIndex(strs[0], "@")
-			path = filepath.Join(path[:i], strs[1])
-		}
-	}
-	return strings.TrimPrefix(path, string(filepath.Separator))
 }
 
 var (

@@ -9,15 +9,17 @@ type PackageLocator struct {
 // SymbolLocator is the response type for the `textDocument/edefinition` extension.
 type SymbolLocator struct {
 	// The fully qualified name of the symbol.
-	Qname string `json:"qname"`
+	Qname string `json:"qname,omitempty"`
 
 	Kind SymbolKind `json:"kind,omitempty"`
 
 	// The file path relative to the repo root URI of the specified symbol.
-	Path string `json:"path"`
+	Path string `json:"path,omitempty"`
 
 	// A concrete location at which the definition is located.
-	Loc Location `json:"location,omitempty"`
+	// TODO(henrywong) 'encoding/json' doesn't support the zero values of structs with omitempty for now, see
+	//  https://github.com/golang/go/issues/11939. That's why we use pointer here.
+	Loc *Location `json:"location,omitempty"`
 
 	Package PackageLocator `json:"package,omitempty"`
 }

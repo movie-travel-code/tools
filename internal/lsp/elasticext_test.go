@@ -8,7 +8,6 @@ import (
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/lsp/tests"
 	"golang.org/x/tools/internal/span"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,8 +29,8 @@ func testLSPExt(t *testing.T, exporter packagestest.Exporter) {
 
 	// We hardcode the expected number of test cases to ensure that all tests
 	// are being executed. If a test is added, this number must be changed.
-	const expectedQNameKindCount = 59
-	const expectedPkgLocatorCount = 2
+	const expectedQNameKindCount = 7
+	const expectedPkgLocatorCount = 6
 	const expectedFullSymbolCount = 14
 
 	files := packagestest.MustCopyFileTree(dir)
@@ -62,14 +61,17 @@ func testLSPExt(t *testing.T, exporter packagestest.Exporter) {
 	session := cache.NewSession(ctx)
 	options := session.Options()
 	options.Env = cfg.Env
-	session.NewView(cfg.Context, extViewName, span.FileURI(cfg.Dir), options)
+	var viewRoot string
+	if strings.Contains(cfg.Dir, "primarymod") {
+		viewRoot = filepath.Join(cfg.Dir, "lspext")
+	} else {
+		viewRoot = filepath.Join(cfg.Dir, "golang.org/x/tools/internal/lsp/lspext")
+	}
+	session.NewView(cfg.Context, extViewName, span.FileURI(viewRoot), options)
 	s := &Server{
 		session:     session,
 		undelivered: make(map[span.URI][]source.Diagnostic),
 	}
-	var (
-		pkgMod = filepath.Join(os.Getenv("GOPATH"), "pkg", "mod")
-	)
 	es := &ElasticServer{*s, nil}
 
 	expectedQNameKinds := make(QnameKindMap)
@@ -99,61 +101,6 @@ func testLSPExt(t *testing.T, exporter packagestest.Exporter) {
 		}
 		expectedPkgLocators.test(t, es)
 	})
-	t.Run("NormalizePath", func(t *testing.T) {
-		t.Helper()
-		testdata := []NormalizeTuple{
-			{
-				RepoURI:     "github.com/json-iter@ator",
-				Path:        "github.com/json-iter@ator/@/@/@23423afasdf/124/wrew@.go",
-				PathWant:    "@/@/@23423afasdf/124/wrew@.go",
-				LocatedDeps: true,
-			},
-			{
-				RepoURI:     "github.com/json-iter@ator/@",
-				Path:        "github.com/json-iter@ator/@/@v0.0.1/@23423afasdf/124/wrew@.go",
-				PathWant:    "@23423afasdf/124/wrew@.go",
-				LocatedDeps: true,
-			},
-			{
-				RepoURI:     "github.com/json-iter@ator/@",
-				Path:        "github.com/json-iter@ator/@/vv0.0.0-20190519123345-abcdefabcdef/@v0.0.1/@23423afasdf/124/wrew@.go",
-				PathWant:    "vv0.0.0-20190519123345-abcdefabcdef/@23423afasdf/124/wrew@.go",
-				LocatedDeps: true,
-			},
-			{
-				RepoURI:     "github.com/json-iter@ator/@",
-				Path:        "github.com/json-iter@ator/@/@v0.0.0-20190519123345-abcdefabcdef/@v0.0.1/@23423afasdf/124/wrew@.go",
-				PathWant:    "@v0.0.0-20190519123345-abcdefabcdef/@v0.0.1/@23423afasdf/124/wrew@.go",
-				LocatedDeps: true,
-			},
-			{
-				RepoURI:     "github.com/json-iter@ator/@",
-				Path:        "github.com/json-iter@ator/@/@@v0.0.0-20190519123345-abcdefabcdef/@23423afasdf/124/wrew@.go",
-				PathWant:    "@/@23423afasdf/124/wrew@.go",
-				LocatedDeps: true,
-			},
-			{
-				RepoURI:     "",
-				Path:        "lsp/elasticserver.go",
-				PathWant:    "lsp/elasticserver.go",
-				LocatedDeps: false,
-			},
-		}
-
-		for _, v := range testdata {
-			var path string
-			if v.LocatedDeps {
-				path = filepath.Join(pkgMod, v.Path)
-			} else {
-				path = filepath.Join(cfg.Dir, v.Path)
-			}
-			pkgLoc := protocol.PackageLocator{RepoURI: v.RepoURI}
-			pathGot := normalizePath(path, cfg.Dir, pkgLoc.RepoURI, pkgMod)
-			if pathGot != v.PathWant {
-				t.Errorf("got %v expected %v", pathGot, v.PathWant)
-			}
-		}
-	})
 	t.Run("Full", func(t *testing.T) {
 		t.Helper()
 		if len(expectedFullSymbol) != expectedFullSymbolCount {
@@ -171,13 +118,6 @@ type QNameKindResult struct {
 type PkgResultTuple struct {
 	PkgName string
 	RepoURI string
-}
-
-type NormalizeTuple struct {
-	RepoURI     string
-	Path        string
-	PathWant    string
-	LocatedDeps bool
 }
 
 type PackageLocator struct {
