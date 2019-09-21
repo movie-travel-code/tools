@@ -8,7 +8,6 @@ import (
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/lsp/tests"
 	"golang.org/x/tools/internal/span"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -61,13 +60,7 @@ func testLSPExt(t *testing.T, exporter packagestest.Exporter) {
 	session := cache.NewSession(ctx)
 	options := session.Options()
 	options.Env = cfg.Env
-	var viewRoot string
-	if strings.Contains(cfg.Dir, "primarymod") {
-		viewRoot = filepath.Join(cfg.Dir, "lspext")
-	} else {
-		viewRoot = filepath.Join(cfg.Dir, "golang.org/x/tools/internal/lsp/lspext")
-	}
-	session.NewView(cfg.Context, extViewName, span.FileURI(viewRoot), options)
+	session.NewView(cfg.Context, extViewName, span.FileURI(cfg.Dir), options)
 	s := &Server{
 		session:     session,
 		undelivered: make(map[span.URI][]source.Diagnostic),

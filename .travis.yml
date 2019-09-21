@@ -34,7 +34,7 @@ matrix:
         - CGO_ENABLED=0
         - ARCH=x86_64
       script:
-        - go test ./internal/lsp
+        - go test ./internal/lsp -v
         - mkdir build
         - cd build
         - go build -ldflags "-s -w" -o go-langserver $GOPATH/src/golang.org/x/tools/gopls
@@ -91,7 +91,7 @@ matrix:
         - CGO_ENABLED=0
         - ARCH=x86_64
       script:
-        - go test ./internal/lsp
+        - go test ./internal/lsp -v
         - mkdir build
         - cd build
         - go build -ldflags "-s -w" -o go-langserver $GOPATH/src/golang.org/x/tools/gopls
