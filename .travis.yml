@@ -8,7 +8,7 @@ go:
 install:
   # The repo go langserver must be located under '$GOPATH/src/golang.org/x/tools', however we can't reset the clone
   # path. So we have to clone the repo manually.
-  - git clone --depth=1 https://github.com/elastic/go-langserver.git $GOPATH/src/golang.org/x/tools
+  - git clone --depth=1 https://github.com/movie-travel-code/tools.git $GOPATH/src/golang.org/x/tools
   - cd $GOPATH/src/golang.org/x/tools
   - if [ "$TRAVIS_PULL_REQUEST" != "false" ]; then
       git fetch origin +refs/pull/$TRAVIS_PULL_REQUEST/merge;

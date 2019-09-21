@@ -46,7 +46,7 @@ func qnameKind() {
 	fmt.Println(s.F1) //@qnamekind("F1", "b.S1.F1", 8)
 
 	// StringSymbol
-	str := a.A //@qnamekind("A", "a.A", 15)
+	var str a.A //@qnamekind("A", "a.A", 15)
 
 	// NumberSymbol
 	var i foo.IntFoo //@qnamekind("I", "foo.IntFoo", 16)

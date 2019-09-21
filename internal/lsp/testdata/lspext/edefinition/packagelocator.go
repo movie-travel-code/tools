@@ -1,7 +1,6 @@
 package edefinition //Test fail here, edefinition("def", "edefinition", 4)
 
 import (
-	jsoniter "github.com/json-iterator/go"
 	"golang.org/x/tools/internal/lsp/foo"
 	"golang.org/x/tools/internal/lsp/godef/a"
 	"golang.org/x/tools/internal/lsp/godef/b"

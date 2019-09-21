@@ -2,12 +2,14 @@ package lsp
 
 import (
 	"context"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/lsp/tests"
 	"golang.org/x/tools/internal/span"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -53,6 +55,7 @@ func testLSPExt(t *testing.T, exporter packagestest.Exporter) {
 	cfg.Fset = token.NewFileSet()
 	cfg.Context = context.Background()
 	cfg.ParseFile = func(fset *token.FileSet, filename string, src []byte) (*ast.File, error) {
+		fmt.Println(filename)
 		return parser.ParseFile(fset, filename, src, parser.AllErrors|parser.ParseComments)
 	}
 
@@ -60,7 +63,13 @@ func testLSPExt(t *testing.T, exporter packagestest.Exporter) {
 	session := cache.NewSession(ctx)
 	options := session.Options()
 	options.Env = cfg.Env
-	session.NewView(cfg.Context, extViewName, span.FileURI(cfg.Dir), options)
+	var viewRoot string
+	if strings.Contains(cfg.Dir, "primarymod") {
+		viewRoot = filepath.Join(cfg.Dir, "lspext")
+	} else {
+		viewRoot = filepath.Join(cfg.Dir, "golang.org/x/tools/internal/lsp/lspext")
+	}
+	session.NewView(cfg.Context, extViewName, span.FileURI(viewRoot), options)
 	s := &Server{
 		session:     session,
 		undelivered: make(map[span.URI][]source.Diagnostic),
