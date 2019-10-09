@@ -11,7 +11,7 @@ type ElasticServer interface {
 	Server
 	EDefinition(context.Context, *DefinitionParams) ([]SymbolLocator, error)
 	Full(context.Context, *FullParams) (FullResponse, error)
-	ManageDeps(context.Context, *[]WorkspaceFolder, interface{}) error
+	ManageDeps(context.Context, *[]WorkspaceFolder, interface{})
 	Cleanup()
 }
 
@@ -56,9 +56,7 @@ func (h elasticServerHandler) Deliver(ctx context.Context, r *jsonrpc2.Request, 
 			sendParseError(ctx, r, err)
 			return true
 		}
-		if err := h.server.ManageDeps(ctx, &params.Event.Added, nil); err != nil {
-			log.Error(ctx, "", err)
-		}
+		h.server.ManageDeps(ctx, &params.Event.Added, nil)
 		if err := h.server.DidChangeWorkspaceFolders(ctx, &params); err != nil {
 			log.Error(ctx, "", err)
 		}
@@ -240,16 +238,7 @@ func (h elasticServerHandler) Deliver(ctx context.Context, r *jsonrpc2.Request, 
 			sendParseError(ctx, r, err)
 			return true
 		}
-		installDeps := false
-		// Peek the 'installGoDependency' option.
-		if opts, ok := params.InitializationOptions.(map[string]interface{}); ok {
-			if opt, ok := opts["installGoDependency"].(bool); ok && opt {
-				installDeps = true
-			}
-		}
-		if err := h.server.ManageDeps(ctx, &params.WorkspaceFolders, installDeps); err != nil {
-			log.Error(ctx, "", err)
-		}
+		h.server.ManageDeps(ctx, &params.WorkspaceFolders, params.InitializationOptions)
 		resp, err := h.server.Initialize(ctx, &params)
 		if err := r.Reply(ctx, resp, err); err != nil {
 			log.Error(ctx, "", err)

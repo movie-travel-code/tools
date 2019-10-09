@@ -6,9 +6,6 @@ package lsp
 
 import (
 	"context"
-	"golang.org/x/tools/internal/telemetry/log"
-	"os/exec"
-
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/span"
 	errors "golang.org/x/xerrors"
@@ -34,21 +31,16 @@ func (s *Server) changeFolders(ctx context.Context, event protocol.WorkspaceFold
 
 func (s *Server) addView(ctx context.Context, name string, uri span.URI) error {
 	options := s.session.Options()
-	if isPureVendor(uri.Filename()) {
-		modulePath := getModulePath(uri.Filename())
-		constructGoModManually(uri.Filename(), modulePath)
+	if !options.InstallGoDependency {
+		// If we disable the go dependency download, trying to find the deps from the vendor folder.
 		ctx = context.WithValue(ctx, "ENABLEVENDOR", true)
 	} else {
-		if options.InstallGoDependency {
-			cmd := exec.Command("go", "mod", "download")
-			cmd.Dir = uri.Filename()
-			if err := cmd.Run(); err != nil {
-				log.Error(ctx, "failed to download the dependencies", err)
-			}
-		} else {
-			// If we disable the go dependency download, trying to find the deps from the vendor folder.
+		index := checkVendorFolder(uri.Filename())
+		if index >= 0 {
 			ctx = context.WithValue(ctx, "ENABLEVENDOR", true)
 		}
+		// Remove this specified entry once the corresponding view has been created.
+		clearVendorFolder(index)
 	}
 	s.stateMu.Lock()
 	state := s.state
