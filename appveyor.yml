@@ -28,6 +28,9 @@ build_script:
   - go get golang.org/x/sync/errgroup
   - go get golang.org/x/xerrors
   - go get github.com/hashicorp/golang-lru
+  - go get -t honnef.co/go/tools/simple
+  - go get -t honnef.co/go/tools/staticcheck
+  - go get -t honnef.co/go/tools/stylecheck
   # TODO(henrywong) For now, there are problems about the windows test.
   # - go test ./internal/lsp -v
   - mkdir go-langserver-windows

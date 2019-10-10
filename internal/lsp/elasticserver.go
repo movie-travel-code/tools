@@ -76,7 +76,7 @@ func (s *ElasticServer) RunElasticServer(ctx context.Context) error {
 func (s *ElasticServer) EDefinition(ctx context.Context, params *protocol.DefinitionParams) ([]protocol.SymbolLocator, error) {
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.session.ViewOf(uri)
-	f, err := getGoFile(ctx, view, uri)
+	f, err := view.GetFile(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +93,7 @@ func (s *ElasticServer) EDefinition(ctx context.Context, params *protocol.Defini
 	if kind == 0 {
 		return nil, fmt.Errorf("no corresponding symbol kind for '" + ident.Name + "'")
 	}
-	qname := getQName(ctx, f, declObj, kind)
+	qname := getQName(ctx, view, f, declObj, kind)
 	declURI := ident.Declaration.URI()
 	declPath := declURI.Filename()
 	pkgLocator, scheme := collectPkgMetadata(declObj.Pkg(), view.Folder().Filename(), declPath)
@@ -123,12 +123,12 @@ func (s *ElasticServer) Full(ctx context.Context, fullParams *protocol.FullParam
 		return fullResponse, nil
 	}
 	view := s.session.ViewOf(uri)
-	f, err := getGoFile(ctx, view, uri)
+	f, err := view.GetFile(ctx, uri)
 	if err != nil {
 		return fullResponse, err
 	}
 	path := f.URI().Filename()
-	cphs, err := f.CheckPackageHandles(ctx)
+	_, cphs, err := view.CheckPackageHandles(ctx, f)
 	if err != nil {
 		return fullResponse, err
 	}
@@ -257,13 +257,14 @@ func getSymbolKind(declObj types.Object) protocol.SymbolKind {
 //
 // TODO(henrywong) It's better to use the scope chain to give a qualified name for the symbols, however there is no
 // APIs can achieve this goals, just traverse the ast node path for now.
-func getQName(ctx context.Context, f source.GoFile, declObj types.Object, kind protocol.SymbolKind) string {
+func getQName(ctx context.Context, view source.View, f source.File, declObj types.Object, kind protocol.SymbolKind) string {
 	qname := declObj.Name()
 	if kind == protocol.Package {
 		return qname
 	}
-	fh := f.Handle(ctx)
-	fAST, _, _, err := f.View().Session().Cache().ParseGoHandle(fh, source.ParseFull).Parse(ctx)
+	s := view.Snapshot()
+	fh := s.Handle(ctx, f)
+	fAST, _, _, err := view.Session().Cache().ParseGoHandle(fh, source.ParseFull).Parse(ctx)
 	if err != nil {
 		return ""
 	}
