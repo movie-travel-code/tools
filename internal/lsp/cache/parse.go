@@ -75,7 +75,7 @@ func (h *parseGoHandle) Mode() source.ParseMode {
 func (h *parseGoHandle) Parse(ctx context.Context) (*ast.File, *protocol.ColumnMapper, error, error) {
 	v := h.handle.Get(ctx)
 	if v == nil {
-		return nil, nil, nil, ctx.Err()
+		return nil, nil, nil, errors.Errorf("no parsed file for %s", h.File().Identity().URI)
 	}
 	data := v.(*parseGoData)
 	return data.ast, data.mapper, data.parseError, data.err
@@ -130,14 +130,19 @@ func parseGo(ctx context.Context, c *cache, fh source.FileHandle, mode source.Pa
 			log.Error(ctx, "failed to fix AST", err)
 		}
 	}
-	// If the file is nil only due to parse errors,
-	// the parse errors are the actual errors.
+
 	if file == nil {
-		return nil, nil, parseError, parseError
+		// If the file is nil only due to parse errors,
+		// the parse errors are the actual errors.
+		err := parseError
+		if err == nil {
+			err = errors.Errorf("no AST for %s", fh.Identity().URI)
+		}
+		return nil, nil, parseError, err
 	}
 	tok := c.FileSet().File(file.Pos())
 	if tok == nil {
-		return nil, nil, parseError, err
+		return nil, nil, parseError, errors.Errorf("no token.File for %s", fh.Identity().URI)
 	}
 	uri := fh.Identity().URI
 	content, _, err := fh.Read(ctx)
@@ -397,15 +402,11 @@ FindTo:
 	case *ast.GoStmt:
 		stmt.Call = call
 	}
-	switch parent := parent.(type) {
-	case *ast.BlockStmt:
-		for i, s := range parent.List {
-			if s == bad {
-				parent.List[i] = stmt
-				break
-			}
-		}
+
+	if !replaceNode(parent, bad, stmt) {
+		return errors.Errorf("couldn't replace %T in %T", stmt, parent)
 	}
+
 	return nil
 }
 
@@ -438,4 +439,57 @@ func offsetPositions(expr ast.Expr, offset token.Pos) {
 
 		return true
 	})
+}
+
+// replaceNode updates parent's child oldChild to be newChild. It
+// retuns whether it replaced successfully.
+func replaceNode(parent, oldChild, newChild ast.Node) bool {
+	if parent == nil || oldChild == nil || newChild == nil {
+		return false
+	}
+
+	parentVal := reflect.ValueOf(parent).Elem()
+	if parentVal.Kind() != reflect.Struct {
+		return false
+	}
+
+	newChildVal := reflect.ValueOf(newChild)
+
+	tryReplace := func(v reflect.Value) bool {
+		if !v.CanSet() || !v.CanInterface() {
+			return false
+		}
+
+		// If the existing value is oldChild, we found our child. Make
+		// sure our newChild is assignable and then make the swap.
+		if v.Interface() == oldChild && newChildVal.Type().AssignableTo(v.Type()) {
+			v.Set(newChildVal)
+			return true
+		}
+
+		return false
+	}
+
+	// Loop over parent's struct fields.
+	for i := 0; i < parentVal.NumField(); i++ {
+		f := parentVal.Field(i)
+
+		switch f.Kind() {
+		// Check interface and pointer fields.
+		case reflect.Interface, reflect.Ptr:
+			if tryReplace(f) {
+				return true
+			}
+
+		// Search through any slice fields.
+		case reflect.Slice:
+			for i := 0; i < f.Len(); i++ {
+				if tryReplace(f.Index(i)) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }

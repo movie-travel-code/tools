@@ -27,10 +27,10 @@ func (s *Server) didChangeWatchedFiles(ctx context.Context, params *protocol.Did
 		ctx := telemetry.File.With(ctx, uri)
 
 		for _, view := range s.session.Views() {
-			gof, _ := view.FindFile(ctx, uri).(source.GoFile)
+			f := view.FindFile(ctx, uri)
 
 			// If we have never seen this file before, there is nothing to do.
-			if gof == nil {
+			if f == nil {
 				continue
 			}
 
@@ -44,7 +44,7 @@ func (s *Server) didChangeWatchedFiles(ctx context.Context, params *protocol.Did
 			case protocol.Changed:
 				log.Print(ctx, "watched file changed", telemetry.File)
 
-				s.session.DidChangeOutOfBand(ctx, gof, change.Type)
+				s.session.DidChangeOutOfBand(ctx, uri, change.Type)
 
 				// Refresh diagnostics to reflect updated file contents.
 				go s.diagnostics(view, uri)
@@ -53,14 +53,14 @@ func (s *Server) didChangeWatchedFiles(ctx context.Context, params *protocol.Did
 			case protocol.Deleted:
 				log.Print(ctx, "watched file deleted", telemetry.File)
 
-				cphs, err := gof.CheckPackageHandles(ctx)
+				_, cphs, err := view.CheckPackageHandles(ctx, f)
 				if err != nil {
 					log.Error(ctx, "didChangeWatchedFiles: GetPackage", err, telemetry.File)
 					continue
 				}
 				// Find a different file in the same package we can use to trigger diagnostics.
 				// TODO(rstambler): Allow diagnostics to be called per-package to avoid this.
-				var otherFile source.GoFile
+				var otherFile source.File
 				sort.Slice(cphs, func(i, j int) bool {
 					return len(cphs[i].Files()) > len(cphs[j].Files())
 				})
@@ -69,15 +69,15 @@ func (s *Server) didChangeWatchedFiles(ctx context.Context, params *protocol.Did
 						continue
 					}
 					ident := ph.File().Identity()
-					if ident.URI == gof.URI() {
+					if ident.URI == f.URI() {
 						continue
 					}
-					otherFile, _ = view.FindFile(ctx, ident.URI).(source.GoFile)
+					otherFile := view.FindFile(ctx, ident.URI)
 					if otherFile != nil {
 						break
 					}
 				}
-				s.session.DidChangeOutOfBand(ctx, gof, change.Type)
+				s.session.DidChangeOutOfBand(ctx, uri, change.Type)
 
 				// If this was the only file in the package, clear its diagnostics.
 				if otherFile == nil {
@@ -86,7 +86,7 @@ func (s *Server) didChangeWatchedFiles(ctx context.Context, params *protocol.Did
 					}
 					return nil
 				}
-				go s.diagnostics(view, uri)
+				go s.diagnostics(view, otherFile.URI())
 			}
 		}
 	}

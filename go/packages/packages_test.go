@@ -881,10 +881,11 @@ func testOverlay(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
 		Files: map[string]interface{}{
-			"a/a.go": `package a; import "golang.org/fake/b"; const A = "a" + b.B`,
-			"b/b.go": `package b; import "golang.org/fake/c"; const B = "b" + c.C`,
-			"c/c.go": `package c; const C = "c"`,
-			"d/d.go": `package d; const D = "d"`,
+			"a/a.go":      `package a; import "golang.org/fake/b"; const A = "a" + b.B`,
+			"b/b.go":      `package b; import "golang.org/fake/c"; const B = "b" + c.C`,
+			"c/c.go":      `package c; const C = "c"`,
+			"c/c_test.go": `package c; import "testing"; func TestC(t *testing.T) {}`,
+			"d/d.go":      `package d; const D = "d"`,
 		}}})
 	defer exported.Cleanup()
 
@@ -899,6 +900,8 @@ func testOverlay(t *testing.T, exporter packagestest.Exporter) {
 		{map[string][]byte{exported.File("golang.org/fake", "b/b.go"): []byte(`package b; import "golang.org/fake/c"; const B = "B" + c.C`)}, `"aBc"`, nil},
 		// Overlay with an existing file in an existing package adding a new import.
 		{map[string][]byte{exported.File("golang.org/fake", "b/b.go"): []byte(`package b; import "golang.org/fake/d"; const B = "B" + d.D`)}, `"aBd"`, nil},
+		// Overlay with an existing file in an existing package.
+		{map[string][]byte{exported.File("golang.org/fake", "c/c.go"): []byte(`package c; import "net/http"; const C = http.MethodGet`)}, `"abGET"`, nil},
 		// Overlay with a new file in an existing package.
 		{map[string][]byte{
 			exported.File("golang.org/fake", "c/c.go"):                                               []byte(`package c;`),
@@ -937,6 +940,43 @@ func testOverlay(t *testing.T, exporter packagestest.Exporter) {
 		})
 		if errs := errorMessages(errors); !reflect.DeepEqual(errs, test.wantErrs) {
 			t.Errorf("%d. got errors %s, want %s", i, errs, test.wantErrs)
+		}
+	}
+}
+
+func TestOverlayDeps(t *testing.T) { packagestest.TestAll(t, testOverlayDeps) }
+func testOverlayDeps(t *testing.T, exporter packagestest.Exporter) {
+	exported := packagestest.Export(t, exporter, []packagestest.Module{{
+		Name: "golang.org/fake",
+		Files: map[string]interface{}{
+			"c/c.go":      `package c; const C = "c"`,
+			"c/c_test.go": `package c; import "testing"; func TestC(t *testing.T) {}`,
+		},
+	}})
+	defer exported.Cleanup()
+
+	exported.Config.Overlay = map[string][]byte{exported.File("golang.org/fake", "c/c.go"): []byte(`package c; import "net/http"; const C = http.MethodGet`)}
+	exported.Config.Mode = packages.NeedName |
+		packages.NeedFiles |
+		packages.NeedCompiledGoFiles |
+		packages.NeedImports |
+		packages.NeedDeps |
+		packages.NeedTypesSizes
+	initial, err := packages.Load(exported.Config, fmt.Sprintf("file=%s", exported.File("golang.org/fake", "c/c.go")))
+	if err != nil {
+		t.Error(err)
+	}
+	contains := func(imports map[string]*packages.Package, wantImport string) bool {
+		for imp := range imports {
+			if imp == wantImport {
+				return true
+			}
+		}
+		return false
+	}
+	for _, pkg := range initial {
+		if !contains(pkg.Imports, "net/http") {
+			t.Errorf("expected %s import in %s", "net/http", pkg.ID)
 		}
 	}
 }
@@ -1543,41 +1583,37 @@ func testName(t *testing.T, exporter packagestest.Exporter) {
 
 func TestName_Modules(t *testing.T) {
 	// Test the top-level package case described in runNamedQueries.
-	// Note that overriding GOPATH below prevents Export from
-	// creating more than one module.
-	exported := packagestest.Export(t, packagestest.Modules, []packagestest.Module{{
-		Name: "golang.org/pkg",
-		Files: map[string]interface{}{
-			"pkg.go": `package pkg`,
-		}}})
+	exported := packagestest.Export(t, packagestest.Modules, []packagestest.Module{
+		{
+			Name: "golang.org/pkg",
+			Files: map[string]interface{}{
+				"pkg.go": `package pkg`,
+			},
+		},
+		{
+			Name: "example.com/tools-testrepo",
+			Files: map[string]interface{}{
+				"pkg/pkg.go": `package pkg`,
+			},
+		},
+		{
+			Name: "example.com/tools-testrepo/v2",
+			Files: map[string]interface{}{
+				"pkg/pkg.go": `package pkg`,
+			},
+		},
+	})
 	defer exported.Cleanup()
 
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	gopath, err := ioutil.TempDir("", "TestName_Modules")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(gopath)
-	if err := copyAll(filepath.Join(wd, "testdata", "TestName_Modules"), gopath); err != nil {
-		t.Fatal(err)
-	}
-	// testdata/TestNamed_Modules contains:
-	// - pkg/mod/github.com/heschik/tools-testrepo@v1.0.0/pkg
-	// - pkg/mod/github.com/heschik/tools-testrepo/v2@v2.0.0/pkg
-	// - src/b/pkg
 	exported.Config.Mode = packages.LoadImports
-	exported.Config.Env = append(exported.Config.Env, "GOPATH="+gopath)
 	initial, err := packages.Load(exported.Config, "iamashamedtousethedisabledqueryname=pkg")
 	if err != nil {
 		t.Fatal(err)
 	}
 	graph, _ := importGraph(initial)
 	wantGraph := `
-* github.com/heschik/tools-testrepo/pkg
-* github.com/heschik/tools-testrepo/v2/pkg
+* example.com/tools-testrepo/pkg
+* example.com/tools-testrepo/v2/pkg
 * golang.org/pkg
 `[1:]
 	if graph != wantGraph {
@@ -2003,8 +2039,8 @@ func testErrorMissingFile(t *testing.T, exporter packagestest.Exporter) {
 	if len(pkgs) == 0 && runtime.GOOS == "windows" {
 		t.Skip("Issue #31344: the ad-hoc command-line-arguments package isn't created on windows")
 	}
-	if len(pkgs) != 1 || pkgs[0].PkgPath != "command-line-arguments" {
-		t.Fatalf("packages.Load: want [command-line-arguments], got %v", pkgs)
+	if len(pkgs) != 1 || (pkgs[0].PkgPath != "command-line-arguments" && pkgs[0].PkgPath != "missing.go") {
+		t.Fatalf("packages.Load: want [command-line-arguments] or [missing.go], got %v", pkgs)
 	}
 	if len(pkgs[0].Errors) == 0 {
 		t.Errorf("result of Load: want package with errors, got none: %+v", pkgs[0])
@@ -2026,24 +2062,16 @@ func testReturnErrorWhenUsingNonGoFiles(t *testing.T, exporter packagestest.Expo
 		}}})
 	defer exported.Cleanup()
 	config := packages.Config{Env: append(os.Environ(), "GOPACKAGESDRIVER=off")}
-	want := "named files must be .go files"
-	pkgs, err := packages.Load(&config, "a/a.go", "b/b.c")
+	pkgs, err := packages.Load(&config, "b/b.c")
 	if err != nil {
-		// Check if the error returned is the one we expected.
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("want error message: %s, got: %s", want, err.Error())
-		}
 		return
 	}
-	if len(pkgs) != 1 || pkgs[0].PkgPath != "command-line-arguments" {
-		t.Fatalf("packages.Load: want [command-line-arguments], got %v", pkgs)
+	// Go <1.14 calls the package command-line-arguments while Go 1.14+ uses the file names.
+	if len(pkgs) != 1 || (pkgs[0].PkgPath != "command-line-arguments" && pkgs[0].PkgPath != "b/b.c") {
+		t.Fatalf("packages.Load: want [command-line-arguments] or [b/b.c], got %v", pkgs)
 	}
 	if len(pkgs[0].Errors) != 1 {
 		t.Fatalf("result of Load: want package with one error, got: %+v", pkgs[0])
-	}
-	got := pkgs[0].Errors[0].Error()
-	if !strings.Contains(got, want) {
-		t.Fatalf("want error message: %s, got: %s", want, got)
 	}
 }
 
@@ -2504,7 +2532,7 @@ func copyAll(srcPath, dstPath string) error {
 		if err != nil {
 			return err
 		}
-		dstFilePath := filepath.Join(dstPath, rel)
+		dstFilePath := strings.Replace(filepath.Join(dstPath, rel), "definitelynot_go.mod", "go.mod", -1)
 		if err := os.MkdirAll(filepath.Dir(dstFilePath), 0755); err != nil {
 			return err
 		}

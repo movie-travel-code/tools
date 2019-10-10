@@ -53,8 +53,8 @@ func (s *Server) initialize(ctx context.Context, params *protocol.ParamInitia) (
 	}
 
 	var codeActionProvider interface{}
-	if params.Capabilities.TextDocument.CodeAction.CodeActionLiteralSupport != nil &&
-		len(params.Capabilities.TextDocument.CodeAction.CodeActionLiteralSupport.CodeActionKind.ValueSet) > 0 {
+	if ca := params.Capabilities.TextDocument.CodeAction; ca != nil && ca.CodeActionLiteralSupport != nil &&
+		len(ca.CodeActionLiteralSupport.CodeActionKind.ValueSet) > 0 {
 		// If the client has specified CodeActionLiteralSupport,
 		// send the code actions we support.
 		//
@@ -66,9 +66,9 @@ func (s *Server) initialize(ctx context.Context, params *protocol.ParamInitia) (
 		codeActionProvider = true
 	}
 	var renameOpts interface{}
-	if params.Capabilities.TextDocument.Rename.PrepareSupport {
+	if r := params.Capabilities.TextDocument.Rename; r != nil {
 		renameOpts = &protocol.RenameOptions{
-			PrepareProvider: true,
+			PrepareProvider: r.PrepareSupport,
 		}
 	} else {
 		renameOpts = true
@@ -82,12 +82,15 @@ func (s *Server) initialize(ctx context.Context, params *protocol.ParamInitia) (
 			DefinitionProvider:         true,
 			DocumentFormattingProvider: true,
 			DocumentSymbolProvider:     true,
-			FoldingRangeProvider:       true,
-			HoverProvider:              true,
-			DocumentHighlightProvider:  true,
-			DocumentLinkProvider:       &protocol.DocumentLinkOptions{},
-			ReferencesProvider:         true,
-			RenameProvider:             renameOpts,
+			ExecuteCommandProvider: &protocol.ExecuteCommandOptions{
+				Commands: options.SupportedCommands,
+			},
+			FoldingRangeProvider:      true,
+			HoverProvider:             true,
+			DocumentHighlightProvider: true,
+			DocumentLinkProvider:      &protocol.DocumentLinkOptions{},
+			ReferencesProvider:        true,
+			RenameProvider:            renameOpts,
 			SignatureHelpProvider: &protocol.SignatureHelpOptions{
 				TriggerCharacters: []string{"(", ","},
 			},
@@ -183,7 +186,7 @@ func (s *Server) fetchConfig(ctx context.Context, name string, folder span.URI, 
 				Section:  "gopls",
 			}, {
 				ScopeURI: protocol.NewURI(folder),
-				Section:  name,
+				Section:  fmt.Sprintf("gopls-%s", name),
 			}},
 		},
 	}

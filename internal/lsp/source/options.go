@@ -9,6 +9,8 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/tools/internal/lsp/diff"
+	"golang.org/x/tools/internal/lsp/diff/myers"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/telemetry/tag"
 	errors "golang.org/x/xerrors"
@@ -26,8 +28,13 @@ var (
 				protocol.SourceOrganizeImports: true,
 				protocol.QuickFix:              true,
 			},
-			Mod: {},
+			Mod: {
+				protocol.SourceOrganizeImports: true,
+			},
 			Sum: {},
+		},
+		SupportedCommands: []string{
+			"tidy", // for go.mod files
 		},
 		Completion: CompletionOptions{
 			Documentation: true,
@@ -35,11 +42,11 @@ var (
 			FuzzyMatching: true,
 			Budget:        100 * time.Millisecond,
 		},
+		ComputeEdits: myers.ComputeEdits,
 	}
 )
 
 type Options struct {
-
 	// Env is the current set of environment overrides on this view.
 	Env []string
 
@@ -48,6 +55,8 @@ type Options struct {
 
 	HoverKind        HoverKind
 	DisabledAnalyses map[string]struct{}
+
+	StaticCheck bool
 
 	WatchFileChanges              bool
 	InsertTextFormat              protocol.InsertTextFormat
@@ -61,15 +70,20 @@ type Options struct {
 
 	SupportedCodeActions map[FileKind]map[protocol.CodeActionKind]bool
 
+	SupportedCommands []string
+
 	// TODO: Remove the option once we are certain there are no issues here.
 	TextDocumentSyncKind protocol.TextDocumentSyncKind
 
 	Completion CompletionOptions
+
+	ComputeEdits diff.ComputeEdits
 }
 
 type CompletionOptions struct {
 	Deep              bool
 	FuzzyMatching     bool
+	CaseSensitive     bool
 	Unimported        bool
 	Documentation     bool
 	FullDocumentation bool
@@ -137,8 +151,7 @@ func SetOptions(options *Options, opts interface{}) OptionResults {
 
 func (o *Options) ForClientCapabilities(caps protocol.ClientCapabilities) {
 	// Check if the client supports snippets in completion items.
-	if caps.TextDocument.Completion.CompletionItem != nil &&
-		caps.TextDocument.Completion.CompletionItem.SnippetSupport {
+	if c := caps.TextDocument.Completion; c != nil && c.CompletionItem != nil && c.CompletionItem.SnippetSupport {
 		o.InsertTextFormat = protocol.SnippetTextFormat
 	}
 	// Check if the client supports configuration messages.
@@ -147,11 +160,13 @@ func (o *Options) ForClientCapabilities(caps protocol.ClientCapabilities) {
 	o.DynamicWatchedFilesSupported = caps.Workspace.DidChangeWatchedFiles.DynamicRegistration
 
 	// Check which types of content format are supported by this client.
-	if len(caps.TextDocument.Hover.ContentFormat) > 0 {
-		o.PreferredContentFormat = caps.TextDocument.Hover.ContentFormat[0]
+	if hover := caps.TextDocument.Hover; hover != nil && len(hover.ContentFormat) > 0 {
+		o.PreferredContentFormat = hover.ContentFormat[0]
 	}
 	// Check if the client supports only line folding.
-	o.LineFoldingOnly = caps.TextDocument.FoldingRange.LineFoldingOnly
+	if fr := caps.TextDocument.FoldingRange; fr != nil {
+		o.LineFoldingOnly = fr.LineFoldingOnly
+	}
 }
 
 func (o *Options) set(name string, value interface{}) OptionResult {
@@ -193,6 +208,8 @@ func (o *Options) set(name string, value interface{}) OptionResult {
 		result.setBool(&o.Completion.Deep)
 	case "fuzzyMatching":
 		result.setBool(&o.Completion.FuzzyMatching)
+	case "caseSensitiveCompletion":
+		result.setBool(&o.Completion.CaseSensitive)
 	case "completeUnimported":
 		result.setBool(&o.Completion.Unimported)
 
@@ -227,6 +244,9 @@ func (o *Options) set(name string, value interface{}) OptionResult {
 		for _, a := range disabledAnalyses {
 			o.DisabledAnalyses[fmt.Sprint(a)] = struct{}{}
 		}
+
+	case "staticcheck":
+		result.setBool(&o.StaticCheck)
 
 	// Deprecated settings.
 	case "wantSuggestedFixes":

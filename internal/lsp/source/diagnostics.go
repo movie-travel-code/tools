@@ -11,35 +11,12 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/asmdecl"
-	"golang.org/x/tools/go/analysis/passes/assign"
-	"golang.org/x/tools/go/analysis/passes/atomic"
-	"golang.org/x/tools/go/analysis/passes/atomicalign"
-	"golang.org/x/tools/go/analysis/passes/bools"
-	"golang.org/x/tools/go/analysis/passes/buildtag"
-	"golang.org/x/tools/go/analysis/passes/cgocall"
-	"golang.org/x/tools/go/analysis/passes/composite"
-	"golang.org/x/tools/go/analysis/passes/copylock"
-	"golang.org/x/tools/go/analysis/passes/httpresponse"
-	"golang.org/x/tools/go/analysis/passes/loopclosure"
-	"golang.org/x/tools/go/analysis/passes/lostcancel"
-	"golang.org/x/tools/go/analysis/passes/nilfunc"
-	"golang.org/x/tools/go/analysis/passes/printf"
-	"golang.org/x/tools/go/analysis/passes/shift"
-	"golang.org/x/tools/go/analysis/passes/stdmethods"
-	"golang.org/x/tools/go/analysis/passes/structtag"
-	"golang.org/x/tools/go/analysis/passes/tests"
-	"golang.org/x/tools/go/analysis/passes/unmarshal"
-	"golang.org/x/tools/go/analysis/passes/unreachable"
-	"golang.org/x/tools/go/analysis/passes/unsafeptr"
-	"golang.org/x/tools/go/analysis/passes/unusedresult"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/telemetry"
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/telemetry/log"
 	"golang.org/x/tools/internal/telemetry/trace"
-	errors "golang.org/x/xerrors"
 )
 
 type Diagnostic struct {
@@ -47,14 +24,10 @@ type Diagnostic struct {
 	Range    protocol.Range
 	Message  string
 	Source   string
-	Severity DiagnosticSeverity
+	Severity protocol.DiagnosticSeverity
+	Tags     []protocol.DiagnosticTag
 
 	SuggestedFixes []SuggestedFix
-}
-
-type SuggestedFix struct {
-	Title string
-	Edits []protocol.TextEdit
 }
 
 type DiagnosticSeverity int
@@ -64,15 +37,25 @@ const (
 	SeverityError
 )
 
-func Diagnostics(ctx context.Context, view View, f GoFile, disabledAnalyses map[string]struct{}) (map[span.URI][]Diagnostic, string, error) {
+func Diagnostics(ctx context.Context, view View, f File, disabledAnalyses map[string]struct{}) (map[span.URI][]Diagnostic, string, error) {
 	ctx, done := trace.StartSpan(ctx, "source.Diagnostics", telemetry.File.Of(f.URI()))
 	defer done()
 
-	cphs, err := f.CheckPackageHandles(ctx)
+	_, cphs, err := view.CheckPackageHandles(ctx, f)
 	if err != nil {
 		return nil, "", err
 	}
 	cph := WidestCheckPackageHandle(cphs)
+
+	// If we are missing dependencies, it may because the user's workspace is
+	// not correctly configured. Report errors, if possible.
+	var warningMsg string
+	if len(cph.MissingDependencies()) > 0 {
+		warningMsg, err = checkCommonErrors(ctx, view, f.URI())
+		if err != nil {
+			log.Error(ctx, "error checking common errors", err, telemetry.File.Of(f.URI))
+		}
+	}
 	pkg, err := cph.Check(ctx)
 	if err != nil {
 		log.Error(ctx, "no package for file", err)
@@ -83,15 +66,6 @@ func Diagnostics(ctx context.Context, view View, f GoFile, disabledAnalyses map[
 	reports := make(map[span.URI][]Diagnostic)
 	for _, fh := range pkg.Files() {
 		clearReports(view, reports, fh.File().Identity().URI)
-	}
-
-	// If we have `go list` errors, we may want to offer a warning message to the user.
-	var warningMsg string
-	if hasListErrors(pkg.GetErrors()) {
-		warningMsg, err = checkCommonErrors(ctx, view, f.URI())
-		if err != nil {
-			log.Error(ctx, "error checking common errors", err, telemetry.File.Of(f.URI))
-		}
 	}
 
 	// Prepare any additional reports for the errors in this package.
@@ -110,13 +84,8 @@ func Diagnostics(ctx context.Context, view View, f GoFile, disabledAnalyses map[
 		}
 	}
 	// Updates to the diagnostics for this package may need to be propagated.
-	revDeps := f.GetActiveReverseDeps(ctx)
-	for _, f := range revDeps {
-		cphs, err := f.CheckPackageHandles(ctx)
-		if err != nil {
-			return nil, "", err
-		}
-		cph := WidestCheckPackageHandle(cphs)
+	revDeps := view.GetActiveReverseDeps(ctx, f)
+	for _, cph := range revDeps {
 		pkg, err := cph.Check(ctx)
 		if err != nil {
 			return nil, warningMsg, err
@@ -144,7 +113,7 @@ func diagnostics(ctx context.Context, view View, pkg Package, reports map[span.U
 			URI:      spn.URI(),
 			Message:  err.Msg,
 			Source:   "LSP",
-			Severity: SeverityError,
+			Severity: protocol.SeverityError,
 		}
 		set, ok := diagSets[diag.URI]
 		if !ok {
@@ -245,13 +214,9 @@ func toDiagnostic(ctx context.Context, view View, diag analysis.Diagnostic, cate
 	if err != nil {
 		return Diagnostic{}, err
 	}
-	gof, ok := f.(GoFile)
-	if !ok {
-		return Diagnostic{}, errors.Errorf("%s is not a Go file", f.URI())
-	}
 	// If the package has changed since these diagnostics were computed,
 	// this may be incorrect. Should the package be associated with the diagnostic?
-	cphs, err := gof.CheckPackageHandles(ctx)
+	_, cphs, err := view.CheckPackageHandles(ctx, f)
 	if err != nil {
 		return Diagnostic{}, err
 	}
@@ -260,22 +225,29 @@ func toDiagnostic(ctx context.Context, view View, diag analysis.Diagnostic, cate
 	if err != nil {
 		return Diagnostic{}, err
 	}
-	ca, err := getCodeActions(ctx, view, pkg, diag)
-	if err != nil {
-		return Diagnostic{}, err
-	}
-
 	rng, err := spanToRange(ctx, view, pkg, spn, false)
 	if err != nil {
 		return Diagnostic{}, err
+	}
+	fixes, err := suggestedFixes(ctx, view, pkg, diag)
+	if err != nil {
+		return Diagnostic{}, err
+	}
+	// This is a bit of a hack, but clients > 3.15 will be able to grey out unnecessary code.
+	// If we are deleting code as part of all of our suggested fixes, assume that this is dead code.
+	// TODO(golang/go/#34508): Return these codes from the diagnostics themselves.
+	var tags []protocol.DiagnosticTag
+	if onlyDeletions(fixes) {
+		tags = append(tags, protocol.Unnecessary)
 	}
 	return Diagnostic{
 		URI:            spn.URI(),
 		Range:          rng,
 		Source:         category,
 		Message:        diag.Message,
-		Severity:       SeverityWarning,
-		SuggestedFixes: ca,
+		Severity:       protocol.SeverityWarning,
+		SuggestedFixes: fixes,
+		Tags:           tags,
 	}, nil
 }
 
@@ -326,40 +298,14 @@ func singleDiagnostic(uri span.URI, format string, a ...interface{}) map[span.UR
 			URI:      uri,
 			Range:    protocol.Range{},
 			Message:  fmt.Sprintf(format, a...),
-			Severity: SeverityError,
+			Severity: protocol.SeverityError,
 		}},
 	}
 }
 
-var Analyzers = []*analysis.Analyzer{
-	// The traditional vet suite:
-	asmdecl.Analyzer,
-	assign.Analyzer,
-	atomic.Analyzer,
-	atomicalign.Analyzer,
-	bools.Analyzer,
-	buildtag.Analyzer,
-	cgocall.Analyzer,
-	composite.Analyzer,
-	copylock.Analyzer,
-	httpresponse.Analyzer,
-	loopclosure.Analyzer,
-	lostcancel.Analyzer,
-	nilfunc.Analyzer,
-	printf.Analyzer,
-	shift.Analyzer,
-	stdmethods.Analyzer,
-	structtag.Analyzer,
-	tests.Analyzer,
-	unmarshal.Analyzer,
-	unreachable.Analyzer,
-	unsafeptr.Analyzer,
-	unusedresult.Analyzer,
-}
-
 func runAnalyses(ctx context.Context, view View, cph CheckPackageHandle, disabledAnalyses map[string]struct{}, report func(a *analysis.Analyzer, diag analysis.Diagnostic) error) error {
 	var analyzers []*analysis.Analyzer
-	for _, a := range Analyzers {
+	for _, a := range view.Analyzers() {
 		if _, ok := disabledAnalyses[a.Name]; ok {
 			continue
 		}

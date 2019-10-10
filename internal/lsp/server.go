@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// Package lsp implements LSP for gopls.
 package lsp
 
 import (
@@ -124,8 +125,8 @@ func (s *Server) Symbol(context.Context, *protocol.WorkspaceSymbolParams) ([]pro
 	return nil, notImplemented("Symbol")
 }
 
-func (s *Server) ExecuteCommand(context.Context, *protocol.ExecuteCommandParams) (interface{}, error) {
-	return nil, notImplemented("ExecuteCommand")
+func (s *Server) ExecuteCommand(ctx context.Context, params *protocol.ExecuteCommandParams) (interface{}, error) {
+	return s.executeCommand(ctx, params)
 }
 
 // Text Synchronization

@@ -119,14 +119,12 @@ func (app *Application) Run(ctx context.Context, args ...string) error {
 	export.AddExporters(ocagent.Connect(ocConfig))
 	app.Serve.app = app
 	if len(args) == 0 {
-		tool.Main(ctx, &app.Serve, args)
-		return nil
+		return tool.Run(ctx, &app.Serve, args)
 	}
 	command, args := args[0], args[1:]
 	for _, c := range app.commands() {
 		if c.Name() == command {
-			tool.Main(ctx, c, args)
-			return nil
+			return tool.Run(ctx, c, args)
 		}
 	}
 	return tool.CommandLineErrorf("Unknown command %v", command)
@@ -142,6 +140,7 @@ func (app *Application) commands() []tool.Application {
 		&check{app: app},
 		&format{app: app},
 		&query{app: app},
+		&rename{app: app},
 		&version{app: app},
 	}
 }
@@ -197,7 +196,9 @@ func (c *connection) initialize(ctx context.Context) error {
 	params := &protocol.ParamInitia{}
 	params.RootURI = string(span.FileURI(c.Client.app.wd))
 	params.Capabilities.Workspace.Configuration = true
-	params.Capabilities.TextDocument.Hover.ContentFormat = []protocol.MarkupKind{protocol.PlainText}
+	params.Capabilities.TextDocument.Hover = &protocol.HoverClientCapabilities{
+		ContentFormat: []protocol.MarkupKind{protocol.PlainText},
+	}
 	if _, err := c.Server.Initialize(ctx, params); err != nil {
 		return err
 	}

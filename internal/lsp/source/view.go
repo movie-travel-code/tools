@@ -22,10 +22,11 @@ import (
 type FileIdentity struct {
 	URI     span.URI
 	Version string
+	Kind    FileKind
 }
 
 func (identity FileIdentity) String() string {
-	return fmt.Sprintf("%s%s", identity.URI, identity.Version)
+	return fmt.Sprintf("%s%s%s", identity.URI, identity.Version, identity.Kind)
 }
 
 // FileHandle represents a handle to a specific version of a single file from
@@ -37,9 +38,6 @@ type FileHandle interface {
 	// Identity returns the FileIdentity for the file.
 	Identity() FileIdentity
 
-	// Kind returns the FileKind for the file.
-	Kind() FileKind
-
 	// Read reads the contents of a file and returns it along with its hash value.
 	// If the file is not available, returns a nil slice and an error.
 	Read(ctx context.Context) ([]byte, string, error)
@@ -48,7 +46,7 @@ type FileHandle interface {
 // FileSystem is the interface to something that provides file contents.
 type FileSystem interface {
 	// GetFile returns a handle for the specified file.
-	GetFile(uri span.URI) FileHandle
+	GetFile(uri span.URI, kind FileKind) FileHandle
 }
 
 // FileKind describes the kind of the file in question.
@@ -59,16 +57,8 @@ const (
 	Go = FileKind(iota)
 	Mod
 	Sum
+	UnknownKind
 )
-
-// TokenHandle represents a handle to the *token.File for a file.
-type TokenHandle interface {
-	// File returns a file handle for which to get the *token.File.
-	File() FileHandle
-
-	// Token returns the *token.File for the file.
-	Token(ctx context.Context) (*token.File, error)
-}
 
 // ParseGoHandle represents a handle to the AST for a file.
 type ParseGoHandle interface {
@@ -115,14 +105,13 @@ type CheckPackageHandle interface {
 	// ParseGoHandle returns a ParseGoHandle for which to get the package.
 	Files() []ParseGoHandle
 
-	// Config is the *packages.Config that the package metadata was loaded with.
-	Config() *packages.Config
-
 	// Check returns the type-checked Package for the CheckPackageHandle.
 	Check(ctx context.Context) (Package, error)
 
 	// Cached returns the Package for the CheckPackageHandle if it has already been stored.
 	Cached(ctx context.Context) (Package, error)
+
+	MissingDependencies() []string
 }
 
 // Cache abstracts the core logic of dealing with the environment from the
@@ -141,9 +130,6 @@ type Cache interface {
 
 	// FileSet returns the shared fileset used by all files in the system.
 	FileSet() *token.FileSet
-
-	// TokenHandle returns a TokenHandle for the given file handle.
-	TokenHandle(fh FileHandle) TokenHandle
 
 	// ParseGoHandle returns a ParseGoHandle for the given file handle.
 	ParseGoHandle(fh FileHandle, mode ParseMode) ParseGoHandle
@@ -189,11 +175,11 @@ type Session interface {
 	IsOpen(uri span.URI) bool
 
 	// Called to set the effective contents of a file from this session.
-	SetOverlay(uri span.URI, data []byte) (wasFirstChange bool)
+	SetOverlay(uri span.URI, kind FileKind, data []byte) (wasFirstChange bool)
 
 	// DidChangeOutOfBand is called when a file under the root folder
 	// changes. The file is not necessarily open in the editor.
-	DidChangeOutOfBand(ctx context.Context, f GoFile, change protocol.FileChangeType)
+	DidChangeOutOfBand(ctx context.Context, uri span.URI, change protocol.FileChangeType)
 
 	// Options returns a copy of the SessionOptions for this session.
 	Options() Options
@@ -239,6 +225,7 @@ type View interface {
 	// Ignore returns true if this file should be ignored by this view.
 	Ignore(span.URI) bool
 
+	// Config returns the configuration for the view.
 	Config(ctx context.Context) *packages.Config
 
 	// RunProcessEnvFunc runs fn with the process env for this view inserted into opts.
@@ -252,34 +239,32 @@ type View interface {
 	// Warning: Do not use this, unless in a test.
 	// This function does not correctly invalidate the view when needed.
 	SetOptions(Options)
+
+	// Analyzers returns the set of Analyzers active for this view.
+	Analyzers() []*analysis.Analyzer
+
+	// CheckPackageHandles returns the CheckPackageHandles for the packages
+	// that this file belongs to.
+	CheckPackageHandles(ctx context.Context, f File) (Snapshot, []CheckPackageHandle, error)
+
+	// GetActiveReverseDeps returns the active files belonging to the reverse
+	// dependencies of this file's package.
+	GetActiveReverseDeps(ctx context.Context, f File) []CheckPackageHandle
+
+	// Snapshot returns the current snapshot for the view.
+	Snapshot() Snapshot
+}
+
+// Snapshot represents the current state for the given view.
+type Snapshot interface {
+	// Handle returns the FileHandle for the given file.
+	Handle(ctx context.Context, f File) FileHandle
 }
 
 // File represents a source file of any type.
 type File interface {
 	URI() span.URI
-	View() View
-	Handle(ctx context.Context) FileHandle
-}
-
-// GoFile represents a Go source file that has been type-checked.
-type GoFile interface {
-	File
-
-	// GetCheckPackageHandles returns the CheckPackageHandles for the packages
-	// that this file belongs to.
-	CheckPackageHandles(ctx context.Context) ([]CheckPackageHandle, error)
-
-	// GetActiveReverseDeps returns the active files belonging to the reverse
-	// dependencies of this file's package.
-	GetActiveReverseDeps(ctx context.Context) []GoFile
-}
-
-type ModFile interface {
-	File
-}
-
-type SumFile interface {
-	File
+	Kind() FileKind
 }
 
 // Package represents a Go package that has been type-checked. It maintains
@@ -295,8 +280,9 @@ type Package interface {
 	GetTypesInfo() *types.Info
 	GetTypesSizes() types.Sizes
 	IsIllTyped() bool
-	GetDiagnostics() []Diagnostic
-	SetDiagnostics(a *analysis.Analyzer, diag []Diagnostic)
+
+	SetDiagnostics(*analysis.Analyzer, []Diagnostic)
+	FindDiagnostic(protocol.Diagnostic) (*Diagnostic, error)
 
 	// GetImport returns the CheckPackageHandle for a package imported by this package.
 	GetImport(ctx context.Context, pkgPath string) (Package, error)

@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"context"
 	"go/format"
-	"log"
 
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/imports"
@@ -25,11 +24,7 @@ func Format(ctx context.Context, view View, f File) ([]protocol.TextEdit, error)
 	ctx, done := trace.StartSpan(ctx, "source.Format")
 	defer done()
 
-	gof, ok := f.(GoFile)
-	if !ok {
-		return nil, errors.Errorf("formatting is not supported for non-Go files")
-	}
-	cphs, err := gof.CheckPackageHandles(ctx)
+	snapshot, cphs, err := view.CheckPackageHandles(ctx, f)
 	if err != nil {
 		return nil, err
 	}
@@ -42,6 +37,11 @@ func Format(ctx context.Context, view View, f File) ([]protocol.TextEdit, error)
 	if err != nil {
 		return nil, err
 	}
+	// Be extra careful that the file's ParseMode is correct,
+	// otherwise we might replace the user's code with a trimmed AST.
+	if ph.Mode() != ParseFull {
+		return nil, errors.Errorf("%s was parsed in the incorrect mode", ph.File().Identity().URI)
+	}
 	file, m, _, err := ph.Parse(ctx)
 	if err != nil {
 		return nil, err
@@ -51,11 +51,11 @@ func Format(ctx context.Context, view View, f File) ([]protocol.TextEdit, error)
 		// have any parse errors and can still be formatted. Using format.Node
 		// on an ast with errors may result in code being added or removed.
 		// Attempt to format the source of this file instead.
-		formatted, err := formatSource(ctx, f)
+		formatted, err := formatSource(ctx, snapshot, f)
 		if err != nil {
 			return nil, err
 		}
-		return computeTextEdits(ctx, ph.File(), m, string(formatted))
+		return computeTextEdits(ctx, view, ph.File(), m, string(formatted))
 	}
 
 	fset := view.Session().Cache().FileSet()
@@ -68,13 +68,14 @@ func Format(ctx context.Context, view View, f File) ([]protocol.TextEdit, error)
 	if err := format.Node(buf, fset, file); err != nil {
 		return nil, err
 	}
-	return computeTextEdits(ctx, ph.File(), m, buf.String())
+	return computeTextEdits(ctx, view, ph.File(), m, buf.String())
 }
 
-func formatSource(ctx context.Context, file File) ([]byte, error) {
+func formatSource(ctx context.Context, s Snapshot, f File) ([]byte, error) {
 	ctx, done := trace.StartSpan(ctx, "source.formatSource")
 	defer done()
-	data, _, err := file.Handle(ctx).Read(ctx)
+
+	data, _, err := s.Handle(ctx, f).Read(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -82,11 +83,11 @@ func formatSource(ctx context.Context, file File) ([]byte, error) {
 }
 
 // Imports formats a file using the goimports tool.
-func Imports(ctx context.Context, view View, f GoFile, rng span.Range) ([]protocol.TextEdit, error) {
+func Imports(ctx context.Context, view View, f File) ([]protocol.TextEdit, error) {
 	ctx, done := trace.StartSpan(ctx, "source.Imports")
 	defer done()
 
-	cphs, err := f.CheckPackageHandles(ctx)
+	_, cphs, err := view.CheckPackageHandles(ctx, f)
 	if err != nil {
 		return nil, err
 	}
@@ -101,6 +102,11 @@ func Imports(ctx context.Context, view View, f GoFile, rng span.Range) ([]protoc
 	ph, err := pkg.File(f.URI())
 	if err != nil {
 		return nil, err
+	}
+	// Be extra careful that the file's ParseMode is correct,
+	// otherwise we might replace the user's code with a trimmed AST.
+	if ph.Mode() != ParseFull {
+		return nil, errors.Errorf("%s was parsed in the incorrect mode", ph.File().Identity().URI)
 	}
 	options := &imports.Options{
 		// Defaults.
@@ -128,7 +134,7 @@ func Imports(ctx context.Context, view View, f GoFile, rng span.Range) ([]protoc
 	if err != nil {
 		return nil, err
 	}
-	return computeTextEdits(ctx, ph.File(), m, string(formatted))
+	return computeTextEdits(ctx, view, ph.File(), m, string(formatted))
 }
 
 type ImportFix struct {
@@ -144,11 +150,7 @@ func AllImportsFixes(ctx context.Context, view View, f File) (edits []protocol.T
 	ctx, done := trace.StartSpan(ctx, "source.AllImportsFixes")
 	defer done()
 
-	gof, ok := f.(GoFile)
-	if !ok {
-		return nil, nil, errors.Errorf("no imports fixes for non-Go files: %v", err)
-	}
-	cphs, err := gof.CheckPackageHandles(ctx)
+	_, cphs, err := view.CheckPackageHandles(ctx, f)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -196,7 +198,7 @@ func AllImportsFixes(ctx context.Context, view View, f File) (edits []protocol.T
 		if err != nil {
 			return err
 		}
-		edits, err = computeTextEdits(ctx, ph.File(), m, string(formatted))
+		edits, err = computeTextEdits(ctx, view, ph.File(), m, string(formatted))
 		if err != nil {
 			return err
 		}
@@ -207,7 +209,7 @@ func AllImportsFixes(ctx context.Context, view View, f File) (edits []protocol.T
 			if err != nil {
 				return err
 			}
-			edits, err := computeTextEdits(ctx, ph.File(), m, string(formatted))
+			edits, err := computeTextEdits(ctx, view, ph.File(), m, string(formatted))
 			if err != nil {
 				return err
 			}
@@ -269,14 +271,13 @@ func hasParseErrors(pkg Package, uri span.URI) bool {
 func hasListErrors(errors []packages.Error) bool {
 	for _, err := range errors {
 		if err.Kind == packages.ListError {
-			log.Printf("LIST ERROR: %v", err)
 			return true
 		}
 	}
 	return false
 }
 
-func computeTextEdits(ctx context.Context, fh FileHandle, m *protocol.ColumnMapper, formatted string) ([]protocol.TextEdit, error) {
+func computeTextEdits(ctx context.Context, view View, fh FileHandle, m *protocol.ColumnMapper, formatted string) ([]protocol.TextEdit, error) {
 	ctx, done := trace.StartSpan(ctx, "source.computeTextEdits")
 	defer done()
 
@@ -284,7 +285,7 @@ func computeTextEdits(ctx context.Context, fh FileHandle, m *protocol.ColumnMapp
 	if err != nil {
 		return nil, err
 	}
-	edits := diff.ComputeEdits(fh.Identity().URI, string(data), formatted)
+	edits := view.Options().ComputeEdits(fh.Identity().URI, string(data), formatted)
 	return ToProtocolEdits(m, edits)
 }
 
