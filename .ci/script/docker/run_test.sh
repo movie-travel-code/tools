@@ -8,5 +8,5 @@ docker run  \
        --rm \
        -v $PWD:/go/src/golang.org/x/tools code-go-langserver-ci \
        /bin/bash -c "set -ex
-            go test ./internal/lsp
+            go test ./internal/lsp -v
        "
