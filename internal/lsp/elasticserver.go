@@ -65,6 +65,7 @@ func RunElasticServerOnAddress(ctx context.Context, cache source.Cache, addr str
 // ElasticServer "inherits" from lsp.server and is used to implement the elastic extension for the official go lsp.
 type ElasticServer struct {
 	Server
+	// The folders that need to be cleanup, like the folders contain the empty go.mod which is created manually.
 	FolderNeedsCleanup []string
 }
 
@@ -164,41 +165,25 @@ func (s *ElasticServer) Full(ctx context.Context, fullParams *protocol.FullParam
 	return fullResponse, nil
 }
 
-// ManageDeps will explore the workspace folders sent from the client and give a whole picture of them. Besides that,
-// ManageDeps will try its best to convert the folders to modules. The core functions, like deps downloading and deps
-// management, will be implemented in the package 'cache'.
-func (s *ElasticServer) ManageDeps(ctx context.Context, folders *[]protocol.WorkspaceFolder, option interface{}) error {
-	installGoDeps := false
-	if v, ok := option.(bool); v && ok {
-		installGoDeps = true
+// ManageDeps will explore the workspace folders sent from the client and manages the corresponding dependencies.
+func (s *ElasticServer) ManageDeps(ctx context.Context, folders *[]protocol.WorkspaceFolder, options interface{}) {
+	installGoDeps := s.session.Options().InstallGoDependency
+	if !installGoDeps {
+		// Peek the value of the option 'installGoDependency' to guide the dependency management.
+		if opts, ok := options.(map[string]interface{}); ok {
+			if opt, ok := opts["installGoDependency"].(bool); ok && opt {
+				installGoDeps = true
+			}
+		}
 	}
-	// In order to handle the modules separately, we consider different modules as different workspace folders, so we
-	// can manage the dependency of different modules separately.
+	depsMgr := DepsManager{installGoDeps: installGoDeps}
 	for _, folder := range *folders {
-		if folder.URI == "" {
-			continue
+		if err := depsMgr.run(ctx, folder); err != nil {
+			log.Error(ctx, "", err)
 		}
-		metadata := &ModuleConverter{folder: span.NewURI(folder.URI).Filename(), installGoDeps: installGoDeps}
-		err := metadata.collectMetadata(ctx)
-		s.FolderNeedsCleanup = append(s.FolderNeedsCleanup, metadata.FolderNeedsCleanup...)
-		if err != nil {
-			return err
-		}
-		// Convert the module folders to the workspace folders.
-		for _, folder := range metadata.moduleFolders {
-			uri := span.NewURI(folder)
-			notExists := true
-			for _, wf := range *folders {
-				if filepath.Clean(string(uri)) == filepath.Clean(wf.URI) {
-					notExists = false
-				}
-			}
-			if notExists {
-				*folders = append(*folders, protocol.WorkspaceFolder{URI: string(uri), Name: filepath.Base(folder)})
-			}
-		}
+		*folders = append(*folders, depsMgr.moduleFolders...)
 	}
-	return nil
+	depsMgr.downloadDeps(ctx, folders)
 }
 
 func (s ElasticServer) Cleanup() {
@@ -425,52 +410,89 @@ var (
 	}
 )
 
-// ModuleConverter serves the following two purposes:
+// DepsManager serves the following purposes:
 // - Convert the folder to module to get rid of the '$GOPATH/src' limitation.
 // - Recognize the potential multi-module cases.
-type ModuleConverter struct {
-	folder             string
-	moduleFolders      []string
+// - Download the dependencies.
+type DepsManager struct {
 	installGoDeps      bool
+	moduleFolders      []protocol.WorkspaceFolder
 	FolderNeedsCleanup []string
 }
 
-func (metadata *ModuleConverter) goModInit(folder string) error {
-	// For the folders which have pure vendor folder, delay the 'go.mod' construction into initialize handler.
-	if isPureVendor(folder) {
-		metadata.FolderNeedsCleanup = append(metadata.FolderNeedsCleanup, folder)
-		return nil
+// run will be called for every 'protocol.WorkspaceFolder' to collect module folders. Besides that specify which folders
+// need cleanup when language server shutdown.
+func (depsMgr *DepsManager) run(ctx context.Context, root protocol.WorkspaceFolder) error {
+	// In order to handle the modules separately, we consider different modules as different workspace folders, so we
+	// can manage the dependency of different modules separately.
+	err, modules := depsMgr.collectMetadata(ctx, span.NewURI(root.URI).Filename())
+	// depsMgr.moduleFolders = append(depsMgr.moduleFolders, root)
+	if err != nil {
+		return err
 	}
+	// Convert the module folders to the workspace folders.
+	for _, folder := range modules {
+		uri := span.NewURI(folder)
+		if filepath.Clean(string(uri)) == filepath.Clean(root.URI) {
+			continue
+		}
+		depsMgr.moduleFolders = append(depsMgr.moduleFolders, protocol.WorkspaceFolder{URI: string(uri), Name: filepath.Base(folder)})
+	}
+	return nil
+}
+
+func (depsMgr DepsManager) downloadDeps(ctx context.Context, folders *[]protocol.WorkspaceFolder) {
+	if !depsMgr.installGoDeps {
+		return
+	}
+	for _, folder := range *folders {
+		dir := span.NewURI(folder.URI).Filename()
+		if checkVendorFolder(dir) >= 0 {
+			continue
+		}
+		cmd := exec.Command("go", "mod", "download")
+		cmd.Env = append(append([]string{}, os.Environ()...), "GOPROXY=https://proxy.golang.org")
+		cmd.Dir = dir
+		if err := cmd.Run(); err != nil {
+			log.Error(ctx, "failed to download the dependencies", err)
+			// If dependencies downloading fails, put the folder under the vendor mode.
+			storeVendorFolder(dir)
+		}
+	}
+}
+
+func (depsMgr *DepsManager) goModInit(folder string) error {
 	modulePath := getModulePath(folder)
-	if metadata.installGoDeps {
+	if depsMgr.installGoDeps {
 		cmd := exec.Command("go", "mod", "init", modulePath)
 		cmd.Dir = folder
 		return cmd.Run()
 	} else {
-		metadata.FolderNeedsCleanup = append(metadata.FolderNeedsCleanup, folder)
+		depsMgr.FolderNeedsCleanup = append(depsMgr.FolderNeedsCleanup, folder)
 		return constructGoModManually(folder, modulePath)
 	}
 }
 
-// collectWorkspaceFolderMetadata explores the workspace folder to collects the meta information of the folder. And
+// collectMetadata explores the workspace folder to collects the meta information of the folder. And
 // create a new 'go.mod' if necessary to cover all the source files.
-func (metadata *ModuleConverter) collectMetadata(ctx context.Context) error {
+func (depsMgr *DepsManager) collectMetadata(ctx context.Context, folder string) (error, []string) {
+	var module []string
 	// Collect 'go.mod' and record them as workspace folders.
-	if err := filepath.Walk(metadata.folder, func(path string, info os.FileInfo, err error) error {
+	if err := filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
 		base := filepath.Base(path)
 		if (base[0] == '.' || base == "vendor") && info.IsDir() {
 			return filepath.SkipDir
-		} else if info.Name() == "go.mod" {
+		} else if info != nil && info.Name() == "go.mod" {
 			dir := filepath.Dir(path)
-			metadata.moduleFolders = append(metadata.moduleFolders, dir)
+			module = append(module, dir)
 		}
 		return nil
 	}); err != nil {
-		return err
+		return err, module
 	}
-	folderUncovered, folderNeedMod, err := collectUncoveredSrc(metadata.folder)
+	folderUncovered, folderNeedMod, err := collectUncoveredSrc(folder)
 	if err != nil {
-		return nil
+		return nil, module
 	}
 	// If folders need to be covered exist, a new 'go.mod' will be created manually.
 	if len(folderUncovered) > 0 {
@@ -493,13 +515,13 @@ func (metadata *ModuleConverter) collectMetadata(ctx context.Context) error {
 	}
 
 	for _, folder := range folderNeedMod {
-		if err := metadata.goModInit(folder); err != nil {
+		if err := depsMgr.goModInit(folder); err != nil {
 			log.Error(ctx, "error when initializing module", err, telemetry.File)
 			continue
 		}
-		metadata.moduleFolders = append(metadata.moduleFolders, folder)
+		module = append(module, folder)
 	}
-	return nil
+	return nil, module
 }
 
 // collectUncoveredSrc explores the rootPath recursively, collects
@@ -700,17 +722,44 @@ func constructGoModManually(folder string, modulePath string) error {
 	return nil
 }
 
-func isPureVendor(folder string) bool {
-	if _, err := os.Stat(filepath.Join(folder, "go.mod")); err == nil {
-		return false
-	}
-	for _, name := range DependencyControlSystem {
-		if _, err := os.Stat(filepath.Join(folder, name)); err == nil {
-			return false
+var (
+	storeVendorFolder, checkVendorFolder, clearVendorFolder = vendorModeHelper()
+)
+
+// vendorModeHelper are only used to transport the vendor mode related information from 'ManageDeps()' to the 'view'
+// creation. It will return three helpers.
+// - one for recording the folders which should be under vendor mode
+// - one for checking whether the folder is under vendor mode
+// - one for clearing the folder when language server jump into new workspace
+func vendorModeHelper() (func(string), func(string) int, func(int)) {
+	var folderUnderVendorMode []string
+	return func(folder string) {
+			folderUnderVendorMode = append(folderUnderVendorMode, folder)
+		}, func(folder string) int {
+			for index, dir := range folderUnderVendorMode {
+				if folder == dir {
+					return index
+				}
+			}
+			if _, err := os.Stat(filepath.Join(folder, "go.mod")); err == nil {
+				return -1
+			}
+			for _, name := range DependencyControlSystem {
+				if _, err := os.Stat(filepath.Join(folder, name)); err == nil {
+					return -1
+				}
+			}
+			if _, err := os.Stat(filepath.Join(folder, "vendor")); err == nil {
+				folderUnderVendorMode = append(folderUnderVendorMode, folder)
+				return len(folderUnderVendorMode) - 1
+			}
+			return -1
+		}, func(index int) {
+			length := len(folderUnderVendorMode)
+			if index < 0 || index >= length {
+				return
+			}
+			folderUnderVendorMode[index] = folderUnderVendorMode[length-1]
+			folderUnderVendorMode = folderUnderVendorMode[:length-1]
 		}
-	}
-	if _, err := os.Stat(filepath.Join(folder, "vendor")); err == nil {
-		return true
-	}
-	return false
 }
