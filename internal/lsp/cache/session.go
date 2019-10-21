@@ -13,12 +13,14 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/lsp/debug"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/lsp/telemetry"
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/telemetry/log"
+	"golang.org/x/tools/internal/telemetry/tag"
 	"golang.org/x/tools/internal/telemetry/trace"
 	"golang.org/x/tools/internal/xcontext"
 	errors "golang.org/x/xerrors"
@@ -125,7 +127,29 @@ func (s *session) NewView(ctx context.Context, name string, folder span.URI, opt
 	// we always need to drop the view map
 	s.viewMap = make(map[span.URI]source.View)
 	debug.AddView(debugView{v})
+	v.snapshot.Parse(ctx)
 	return v
+}
+
+func (s *snapshot) Parse(ctx context.Context) {
+	v := s.view
+	cfg := v.Config(ctx)
+	pkgs, err := packages.Load(cfg, "./...")
+	if len(pkgs) == 0 || (len(pkgs) == 1 && pkgs[0].ID == "command-line-arguments") {
+		// Can't load the packages, give up.
+		log.Error(ctx, "go list fails for the whole workspace folder", err)
+		return
+	}
+
+	for _, pkg := range pkgs {
+		log.Print(ctx, "go/packages.Load", tag.Of("package", pkg.PkgPath), tag.Of("files", pkg.CompiledGoFiles))
+
+		// Set the metadata for this package.
+		if err := s.updateImports(ctx, packagePath(pkg.PkgPath), pkg, cfg); err != nil {
+			return
+		}
+		s.getMetadata(packageID(pkg.ID))
+	}
 }
 
 // View returns the view by name.
